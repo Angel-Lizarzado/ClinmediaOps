@@ -1,6 +1,6 @@
 {
   "name": "kraken-cli",
-  "version": "1.22.33",
+  "version": "1.22.59",
   "description": "Kraken CLI Control Center - Desktop application for managing WordPress migrations",
   "main": "src/electron/main.js",
   "scripts": {
@@ -133,6 +133,7 @@
     "nsis": {
       "oneClick": true,
       "perMachine": false,
+      "include": "build/installer.nsh",
       "artifactName": "KrakenCLI-Setup-${version}.${ext}",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
