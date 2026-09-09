@@ -728,9 +728,7 @@ if [ "$DRY_RUN" = "0" ]; then
 
   if ${wpCli} plugin is-installed ${WPS_HIDE_LOGIN_SLUG} >/dev/null 2>&1; then
     ${wpCli} plugin activate ${WPS_HIDE_LOGIN_SLUG} >/dev/null 2>&1 || true
-    EXISTING_WHL=$(${wpCli} option get whl_page 2>/dev/null | tr -d '[:space:]')
-    TARGET_SLUG="$EXISTING_WHL"
-    [ -z "$TARGET_SLUG" ] && TARGET_SLUG=${shellQuote(LOGIN_SLUG)}
+    TARGET_SLUG=${shellQuote(LOGIN_SLUG)}
     ${wpCli} option update whl_page "$TARGET_SLUG" >/dev/null 2>&1 || true
     ${wpCli} option update whl_redirect_admin 1 >/dev/null 2>&1 || true
     ${wpCli} rewrite flush --hard >/dev/null 2>&1 || true
