@@ -67,6 +67,7 @@ async function reconstructDomain({
   elementorZipRemotePath = null,
   elementorLicenseKey    = null,
   extraZipRemotePath     = null,
+  excludedBlacklistSlugs = [],
   mode = 'full',
   dryRun = false,
   onStep = () => {},
@@ -119,7 +120,7 @@ async function reconstructDomain({
     }
 
     if (mode === 'solo-plugin') {
-      await runStep6(ctx, { elementorZipRemotePath, elementorLicenseKey, extraZipRemotePath });
+      await runStep6(ctx, { elementorZipRemotePath, elementorLicenseKey, extraZipRemotePath, excludedBlacklistSlugs });
       return { success: true, steps };
     }
 
@@ -139,7 +140,7 @@ async function reconstructDomain({
     await runStep5(ctx);
     assertNotAborted(ctx.signal);
 
-    await runStep6(ctx, { elementorZipRemotePath, elementorLicenseKey, extraZipRemotePath });
+    await runStep6(ctx, { elementorZipRemotePath, elementorLicenseKey, extraZipRemotePath, excludedBlacklistSlugs });
     assertNotAborted(ctx.signal);
 
     await runStep7(ctx);

@@ -289,9 +289,16 @@ export default function CmsAuditTab({ server }: { server: any }) {
     setFilterFailed(false);
     setGlobalMsg('');
 
+    let excludedBlacklistSlugs: string[] = [];
+    try {
+      const saved = localStorage.getItem('kraken_excluded_blacklist_slugs');
+      if (saved) excludedBlacklistSlugs = JSON.parse(saved);
+    } catch {}
+
     const res = await api?.invoke('cms:start-batch', {
       serverName, domains, localZipPath: localZipPath || null,
       targetPhpVersion, mode, dryRun, phpSwitch,
+      excludedBlacklistSlugs,
     });
     if (!res?.success) {
       batchOwner.current = false;

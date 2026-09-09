@@ -243,11 +243,14 @@ function registerCmsHandlers(ipcMain, mainWindow) {
 
   // ── START BATCH: reconstruir dominios seleccionados ───────────────────────
   ipcMain.handle('cms:start-batch', async (_event, {
-    serverName, domains, localZipPath, targetPhpVersion, mode, dryRun, phpSwitch,
+    serverName, domains, localZipPath, targetPhpVersion, mode, dryRun, phpSwitch, excludedBlacklistSlugs,
   }) => {
     console.log(`\n[CMS IPC] ==========================================`);
     console.log(`[CMS IPC] RECIBIDO cms:start-batch`);
     console.log(`[CMS IPC] Servidor: ${serverName}, Dominios: ${domains.length}, Modo: ${mode}, DryRun: ${dryRun}`);
+    if (excludedBlacklistSlugs?.length) {
+      console.log(`[CMS IPC] Plugins excluidos de la lista negra: ${excludedBlacklistSlugs.join(', ')}`);
+    }
     console.log(`[CMS IPC] ==========================================\n`);
 
     if (_processRunning) {
@@ -290,6 +293,7 @@ function registerCmsHandlers(ipcMain, mainWindow) {
           mode: mode || 'full',
           dryRun: !!dryRun,
           phpSwitch: phpSwitch !== false,
+          excludedBlacklistSlugs: Array.isArray(excludedBlacklistSlugs) ? excludedBlacklistSlugs : [],
           signal: _abortController.signal,
           onProgress: (event) => {
             emit('cms:progress', event);

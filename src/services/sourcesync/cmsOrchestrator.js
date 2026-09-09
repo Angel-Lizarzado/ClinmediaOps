@@ -142,6 +142,7 @@ async function runCmsBatch({
   mode = 'full',
   dryRun = false,
   phpSwitch = true,
+  excludedBlacklistSlugs = [],
   onProgress = () => {},
   signal,
 }) {
@@ -230,6 +231,7 @@ async function runCmsBatch({
         elementorZipRemotePath: remoteElementorZip,
         elementorLicenseKey,
         extraZipRemotePath: remoteExtraZip,
+        excludedBlacklistSlugs,
         mode, dryRun,
         signal,
         onStep: (stepNum, stepTotal, msg, level) => {

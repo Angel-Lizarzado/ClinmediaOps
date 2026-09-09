@@ -47,6 +47,15 @@ const MODE_DESCRIPTIONS: Record<CmsMode, string> = {
   'flush-permalinks': 'Flusheea permalinks y caché WP (wp rewrite flush --hard)',
 };
 
+const BLACKLIST_PLUGINS = [
+  { slug: 'all-in-one-wp-migration', name: 'All-in-One WP Migration' },
+  { slug: 'gdpr-cookie-compliance', name: 'GDPR Cookie Compliance' },
+  { slug: 'litespeed-cache', name: 'LiteSpeed Cache' },
+  { slug: 'duplicate-page', name: 'Duplicate Page' },
+  { slug: 'starter-templates', name: 'Starter Templates' },
+  { slug: 'migrate-guru', name: 'Migrate Guru' },
+];
+
 // ── Badge component ───────────────────────────────────────────────────────────
 
 function StatusBadge({ status }: { status: DomainEntry['status'] }) {
@@ -79,6 +88,26 @@ export default function CmsReconstructorModule({ onLog }: Props) {
   const [dryRun, setDryRun]               = useState(false);
   const [phpSwitch, setPhpSwitch]         = useState(false);
   const [servers, setServers]             = useState<string[]>([]);
+
+  // Lista negra: plugins excluidos (deshabilitados de la purga, para conservarlos)
+  const [excludedBlacklistSlugs, setExcludedBlacklistSlugs] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('kraken_excluded_blacklist_slugs');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const toggleBlacklistSlug = (slug: string) => {
+    setExcludedBlacklistSlugs(prev => {
+      const next = prev.includes(slug) ? prev.filter(s => s !== slug) : [...prev, slug];
+      try {
+        localStorage.setItem('kraken_excluded_blacklist_slugs', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
 
   // Elementor Pro auto-detectado desde configuración
   const [elementorConfig, setElementorConfig] = useState<{ zipPath: string; licenseKey: string } | null>(null);
@@ -274,6 +303,7 @@ export default function CmsReconstructorModule({ onLog }: Props) {
         mode,
         dryRun,
         phpSwitch,
+        excludedBlacklistSlugs,
       });
     }
 
@@ -282,7 +312,7 @@ export default function CmsReconstructorModule({ onLog }: Props) {
       setGlobalMsg(`Error: ${res?.error || 'No se pudo iniciar'}`);
       onLog(`[CMS] ${res?.error}`, 'error');
     }
-  }, [serverName, parsedDomains, localZipPath, targetPhpVersion, mode, dryRun, phpSwitch, onLog]);
+  }, [serverName, parsedDomains, localZipPath, targetPhpVersion, mode, dryRun, phpSwitch, excludedBlacklistSlugs, onLog]);
 
   const handleAbort = useCallback(async () => {
     await api?.invoke('cms:abort');
@@ -515,25 +545,64 @@ export default function CmsReconstructorModule({ onLog }: Props) {
                   </div>
                 </div>
 
-                {/* Lista negra — informativa */}
+                {/* Lista negra — configurable */}
                 <div className="space-y-xs pt-xs border-t border-outline-variant/30">
-                  <label className="font-label-caps text-[10px] text-outline">
-                    Lista negra
-                    <span className="ml-sm text-[9px] font-normal normal-case text-on-surface-variant">(se desactivarán, no se eliminarán)</span>
-                  </label>
-                  {[
-                    'All-in-One WP Migration',
-                    'GDPR Cookie Compliance',
-                    'LiteSpeed Cache',
-                    'Duplicate Page',
-                    'Starter Templates',
-                    'Migrate Guru',
-                  ].map(name => (
-                    <div key={name} className="flex items-center gap-xs">
-                      <span className="text-error text-[10px]">&#x25CF;</span>
-                      <span className="font-code-sm text-[10px] text-on-surface-variant">{name}</span>
-                    </div>
-                  ))}
+                  <div className="flex items-center justify-between">
+                    <label className="font-label-caps text-[10px] text-outline">
+                      Lista negra de plugins
+                    </label>
+                    <span className="text-[9px] font-mono text-on-surface-variant">
+                      {excludedBlacklistSlugs.length > 0
+                        ? `${excludedBlacklistSlugs.length} conservado(s)`
+                        : 'Todos a purgar'}
+                    </span>
+                  </div>
+                  <p className="text-[9px] text-on-surface-variant leading-snug">
+                    Marcados se purgan. Desmarcá para conservarlos intactos en el sitio:
+                  </p>
+                  <div className="space-y-1 pt-0.5">
+                    {BLACKLIST_PLUGINS.map(p => {
+                      const isPurged = !excludedBlacklistSlugs.includes(p.slug);
+                      return (
+                        <label
+                          key={p.slug}
+                          className={`flex items-center justify-between gap-xs py-1 px-2 rounded border transition-all cursor-pointer select-none ${
+                            isPurged
+                              ? 'bg-surface-container/50 border-outline-variant/30 hover:border-error/40'
+                              : 'bg-surface-container-low border-secondary/40 hover:border-secondary/60'
+                          }`}
+                        >
+                          <div className="flex items-center gap-xs min-w-0">
+                            <input
+                              type="checkbox"
+                              checked={isPurged}
+                              onChange={() => toggleBlacklistSlug(p.slug)}
+                              className="w-3.5 h-3.5 rounded border-outline-variant bg-surface-container text-secondary focus:ring-secondary cursor-pointer shrink-0"
+                            />
+                            <span
+                              className={`font-code-sm text-[10px] truncate transition-colors ${
+                                isPurged
+                                  ? 'text-on-surface font-medium'
+                                  : 'text-on-surface-variant'
+                              }`}
+                              title={p.name}
+                            >
+                              {p.name}
+                            </span>
+                          </div>
+                          <span
+                            className={`text-[9px] font-mono px-1.5 py-0.5 rounded border font-semibold shrink-0 ${
+                              isPurged
+                                ? 'border-error/30 text-error bg-error/10'
+                                : 'border-secondary/40 text-secondary bg-secondary/10'
+                            }`}
+                          >
+                            {isPurged ? 'Purgar' : 'Conservar'}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
             )}
