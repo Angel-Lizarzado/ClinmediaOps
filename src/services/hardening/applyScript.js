@@ -525,13 +525,33 @@ SQL_EOF
     fi
   fi
 
-  # Permisos estrictos
-  find "$WEBROOT" -type d -exec chmod 755 {} \\; 2>/dev/null || true
-  find "$WEBROOT" -type f -exec chmod 644 {} \\; 2>/dev/null || true
-  SYS_OWNER=$(stat -c '%U:%G' "$WEBROOT" 2>/dev/null)
-  [ -n "$SYS_OWNER" ] && chown "$SYS_OWNER" "$WP_CONFIG" 2>/dev/null || true
+  # Normalización profunda de usuario y permisos en saneo
+  _SYS_USER_SANEO=""
+  _CU_SANEO=$(stat -c '%U' "$WEBROOT" 2>/dev/null)
+  if [ -n "$_CU_SANEO" ] && [ "$_CU_SANEO" != "root" ]; then
+    _SYS_USER_SANEO="$_CU_SANEO"
+  fi
+  if [ -z "$_SYS_USER_SANEO" ]; then
+    _SYS_USER_SANEO=$(plesk db -sNe "SELECT su.login FROM domains d JOIN hosting h ON h.dom_id=d.id JOIN sys_users su ON su.id=h.sys_user_id WHERE d.name='$DOMAIN' LIMIT 1" 2>/dev/null | xargs)
+  fi
+  if [ -z "$_SYS_USER_SANEO" ]; then
+    _SYS_USER_SANEO=$(plesk bin site --info "$DOMAIN" 2>/dev/null | grep -i "System user" | head -1 | awk '{print $NF}' | xargs)
+  fi
+  if [ -z "$_SYS_USER_SANEO" ]; then
+    _PU_SANEO=$(stat -c '%U' "$WEBROOT/.." 2>/dev/null)
+    [ -n "$_PU_SANEO" ] && [ "$_PU_SANEO" != "root" ] && _SYS_USER_SANEO="$_PU_SANEO"
+  fi
+
+  if [ -n "$_SYS_USER_SANEO" ] && [ "$_SYS_USER_SANEO" != "root" ]; then
+    _SYS_GRP_SANEO="psacln"
+    getent group psacln >/dev/null 2>&1 || _SYS_GRP_SANEO="$_SYS_USER_SANEO"
+    chown -R "$_SYS_USER_SANEO:$_SYS_GRP_SANEO" "$WEBROOT" 2>/dev/null || true
+  fi
+
+  find "$WEBROOT" -type d -exec chmod 755 {} + 2>/dev/null || true
+  find "$WEBROOT" -type f -exec chmod 644 {} + 2>/dev/null || true
   chmod 640 "$WP_CONFIG" 2>/dev/null || chmod 600 "$WP_CONFIG" 2>/dev/null || true
-  emit_measure "sanitize" 1 "archivos purgados: $SANEO_N; DB desinfectada (spam/transients/bots atacantes); permisos 755/644 y wp-config 640"
+  emit_measure "sanitize" 1 "archivos purgados: $SANEO_N; DB desinfectada; permisos y ownership normalizados (755/644, wp-config 640)"
 else
   emit_measure "sanitize" 0 "DRY-RUN: no se purgó nada"
 fi
@@ -610,6 +630,22 @@ else
         run_wp elementor-pro license activate "$_EP_LICENSE" 2>/dev/null || true
       fi
     fi
+  fi
+
+  # Normalizar permisos y propietarios tras instalación por WP-CLI
+  _SYS_USER_REINSTALL=""
+  _CU_REINSTALL=$(stat -c '%U' "$WEBROOT" 2>/dev/null)
+  if [ -n "$_CU_REINSTALL" ] && [ "$_CU_REINSTALL" != "root" ]; then
+    _SYS_USER_REINSTALL="$_CU_REINSTALL"
+  fi
+  if [ -z "$_SYS_USER_REINSTALL" ]; then
+    _SYS_USER_REINSTALL=$(plesk db -sNe "SELECT su.login FROM domains d JOIN hosting h ON h.dom_id=d.id JOIN sys_users su ON su.id=h.sys_user_id WHERE d.name='$DOMAIN' LIMIT 1" 2>/dev/null | xargs)
+  fi
+  if [ -n "$_SYS_USER_REINSTALL" ] && [ "$_SYS_USER_REINSTALL" != "root" ]; then
+    _SYS_GRP_REINSTALL="psacln"
+    getent group psacln >/dev/null 2>&1 || _SYS_GRP_REINSTALL="$_SYS_USER_REINSTALL"
+    [ -d "$WEBROOT/wp-content/plugins" ] && chown -R "$_SYS_USER_REINSTALL:$_SYS_GRP_REINSTALL" "$WEBROOT/wp-content/plugins" 2>/dev/null || true
+    [ -d "$WEBROOT/wp-content/themes" ] && chown -R "$_SYS_USER_REINSTALL:$_SYS_GRP_REINSTALL" "$WEBROOT/wp-content/themes" 2>/dev/null || true
   fi
 
   emit_measure "reinstall" 1 "Reinstalados $_REINSTALL_OK componentes oficiales/configurados ($_REINSTALL_ERR omitidos/privados)"
@@ -822,8 +858,17 @@ else
   else
     cat "$TMP_DIR/wpconfig_block" >> "$WP_CONFIG"
   fi
-  SYS_OWNER=$(stat -c '%U:%G' "$WEBROOT" 2>/dev/null)
-  [ -n "$SYS_OWNER" ] && chown "$SYS_OWNER" "$WP_CONFIG" 2>/dev/null || true
+  _CFG_USER=""
+  _CFG_U=$(stat -c '%U' "$WEBROOT" 2>/dev/null)
+  if [ -n "$_CFG_U" ] && [ "$_CFG_U" != "root" ]; then
+    _CFG_USER="$_CFG_U"
+  fi
+  if [ -z "$_CFG_USER" ]; then
+    _CFG_USER=$(plesk db -sNe "SELECT su.login FROM domains d JOIN hosting h ON h.dom_id=d.id JOIN sys_users su ON su.id=h.sys_user_id WHERE d.name='$DOMAIN' LIMIT 1" 2>/dev/null | xargs)
+  fi
+  if [ -n "$_CFG_USER" ] && [ "$_CFG_USER" != "root" ]; then
+    chown "$_CFG_USER:psacln" "$WP_CONFIG" 2>/dev/null || chown "$_CFG_USER:$_CFG_USER" "$WP_CONFIG" 2>/dev/null || true
+  fi
   chmod 640 "$WP_CONFIG" 2>/dev/null || chmod 600 "$WP_CONFIG" 2>/dev/null || true
 
   # Comprobar que el PHP sigue siendo sintácticamente válido. Si lo rompimos,
@@ -868,15 +913,44 @@ fi
 
   partes.push(`
 # ── Restaurar propietario y permisos seguros para Plesk/PHP-FPM ────────────
-SYS_OWNER=$(stat -c '%U:%G' "$WEBROOT" 2>/dev/null)
-if [ -n "$SYS_OWNER" ]; then
-  chown "$SYS_OWNER" "$WP_CONFIG" 2>/dev/null || true
-  [ -f "$HT_ROOT" ] && chown "$SYS_OWNER" "$HT_ROOT" 2>/dev/null || true
-  [ -f "$WEBROOT/.user.ini" ] && chown "$SYS_OWNER" "$WEBROOT/.user.ini" 2>/dev/null || true
-  [ -d "$MU_DIR" ] && chown -R "$SYS_OWNER" "$MU_DIR" 2>/dev/null || true
-  [ -d "$WEBROOT/wp-content/plugins/${WPS_HIDE_LOGIN_SLUG}" ] && chown -R "$SYS_OWNER" "$WEBROOT/wp-content/plugins/${WPS_HIDE_LOGIN_SLUG}" 2>/dev/null || true
+# ── Restaurar propietario y permisos seguros para Plesk/PHP-FPM ────────────
+# Resolver usuario real del vhost Plesk (NUNCA dejar archivos propiedad de root)
+VHOST_SYS_USER=""
+_CU=$(stat -c '%U' "$WEBROOT" 2>/dev/null)
+if [ -n "$_CU" ] && [ "$_CU" != "root" ]; then
+  VHOST_SYS_USER="$_CU"
 fi
+if [ -z "$VHOST_SYS_USER" ]; then
+  VHOST_SYS_USER=$(plesk db -sNe "SELECT su.login FROM domains d JOIN hosting h ON h.dom_id=d.id JOIN sys_users su ON su.id=h.sys_user_id WHERE d.name='$DOMAIN' LIMIT 1" 2>/dev/null | xargs)
+fi
+if [ -z "$VHOST_SYS_USER" ]; then
+  VHOST_SYS_USER=$(plesk db -sNe "SELECT su.login FROM domain_aliases da JOIN domains d ON d.id=da.dom_id JOIN hosting h ON h.dom_id=d.id JOIN sys_users su ON su.id=h.sys_user_id WHERE da.name='$DOMAIN' LIMIT 1" 2>/dev/null | xargs)
+fi
+if [ -z "$VHOST_SYS_USER" ]; then
+  VHOST_SYS_USER=$(plesk db -sNe "SELECT su.login FROM subdomains s JOIN domains d ON d.id=s.dom_id JOIN hosting h ON h.dom_id=d.id JOIN sys_users su ON su.id=h.sys_user_id WHERE (s.name='$DOMAIN' OR CONCAT(s.name, '.', d.name)='$DOMAIN') LIMIT 1" 2>/dev/null | xargs)
+fi
+if [ -z "$VHOST_SYS_USER" ]; then
+  VHOST_SYS_USER=$(plesk bin site --info "$DOMAIN" 2>/dev/null | grep -i "System user" | head -1 | awk '{print $NF}' | xargs)
+fi
+if [ -z "$VHOST_SYS_USER" ]; then
+  _PARENT_U=$(stat -c '%U' "$WEBROOT/.." 2>/dev/null)
+  [ -n "$_PARENT_U" ] && [ "$_PARENT_U" != "root" ] && VHOST_SYS_USER="$_PARENT_U"
+fi
+
+if [ -n "$VHOST_SYS_USER" ] && [ "$VHOST_SYS_USER" != "root" ]; then
+  VHOST_SYS_GRP="psacln"
+  getent group psacln >/dev/null 2>&1 || VHOST_SYS_GRP="$VHOST_SYS_USER"
+  chown -R "$VHOST_SYS_USER:$VHOST_SYS_GRP" "$WEBROOT" 2>/dev/null || true
+fi
+
+# Normalización total de permisos en el árbol webroot
+find "$WEBROOT" -type d -exec chmod 755 {} + 2>/dev/null || true
+find "$WEBROOT" -type f -exec chmod 644 {} + 2>/dev/null || true
+
+# Permisos seguros para archivos críticos
 chmod 640 "$WP_CONFIG" 2>/dev/null || chmod 600 "$WP_CONFIG" 2>/dev/null || true
+[ -f "$HT_ROOT" ] && chmod 644 "$HT_ROOT" 2>/dev/null || true
+[ -f "$WEBROOT/.user.ini" ] && chmod 644 "$WEBROOT/.user.ini" 2>/dev/null || true
 
 echo "[BLINDAJE OK] Terminado para $DOMAIN"
 `);
@@ -947,9 +1021,18 @@ if grep -q "DISALLOW_FILE_MODS" "$WP_CONFIG" || has_block "$WP_CONFIG" ${shellQu
   cp -f "$WP_CONFIG" "$WP_CONFIG.kraken.bak" 2>/dev/null || true
   strip_block "$WP_CONFIG" ${shellQuote(PHP_MARK_BEGIN)} ${shellQuote(PHP_MARK_END)}
   sed -i "/DISALLOW_FILE_EDIT/d; /DISALLOW_FILE_MODS/d; /WP_DEBUG_DISPLAY/d" "$WP_CONFIG" 2>/dev/null || true
-  _USER=$(stat -c '%U' "$WP_CONFIG" 2>/dev/null || echo "root")
-  chown "$_USER:psacln" "$WP_CONFIG" 2>/dev/null || true
-  chmod 640 "$WP_CONFIG" 2>/dev/null || true
+  _USER=""
+  _CFG_U=$(stat -c '%U' "$WP_CONFIG" 2>/dev/null)
+  if [ -n "$_CFG_U" ] && [ "$_CFG_U" != "root" ]; then
+    _USER="$_CFG_U"
+  fi
+  if [ -z "$_USER" ]; then
+    _USER=$(plesk db -sNe "SELECT su.login FROM domains d JOIN hosting h ON h.dom_id=d.id JOIN sys_users su ON su.id=h.sys_user_id WHERE d.name='$DOMAIN' LIMIT 1" 2>/dev/null | xargs)
+  fi
+  if [ -n "$_USER" ] && [ "$_USER" != "root" ]; then
+    chown "$_USER:psacln" "$WP_CONFIG" 2>/dev/null || chown "$_USER:$_USER" "$WP_CONFIG" 2>/dev/null || true
+  fi
+  chmod 640 "$WP_CONFIG" 2>/dev/null || chmod 600 "$WP_CONFIG" 2>/dev/null || true
   php -l "$WP_CONFIG" >/dev/null 2>&1 || cp -f "$WP_CONFIG.kraken.bak" "$WP_CONFIG"
   echo "[CANDADO] Levantado para ${domain}"
 else

@@ -425,80 +425,9 @@ async function runClean(sshClient, domain, ghostAdminsConfig = [], onProgress) {
  * Genera script de hardening Bash (solo Fase 10).
  * @param {string} domain - Dominio a proteger
  */
-function generateHardenScript(domain) {
-  return [
-    'HTTPDOCS="/var/www/vhosts/' + domain + '/httpdocs"',
-    'cd "$HTTPDOCS" 2>/dev/null || { echo \'@@@PROGRESS@@@{"step":"done","msg":"httpdocs no encontrado"}@@@END@@@\'; exit 1; }',
-    '',
-    'echo \'@@@PROGRESS@@@{"step":"init","msg":"Iniciando protección y optimización..."}@@@END@@@\'',
-    '',
-    'WP_CONFIG="$HTTPDOCS/wp-config.php"',
-    'if [ -f "$WP_CONFIG" ]; then',
-    '  # 1. Limpieza: Eliminar index.html intruso',
-    '  if [ -f "$HTTPDOCS/index.html" ]; then',
-    '    rm -f "$HTTPDOCS/index.html"',
-    '  fi',
-    '',
-    '  # 1b. Purgar backups y volcados SQL (datos sensibles expuestos)',
-    '  find "$HTTPDOCS" -maxdepth 3 -type f \\( -name "*.tar.gz" -o -name "*.sql" \\) -exec rm -f {} \\; 2>/dev/null || true',
-    '',
-    '  # 1c. Purgar backdoors disfrazados de sitemap (conservar sitemap.xml y sitemap_index.xml legítimos)',
-    '  find "$HTTPDOCS" -maxdepth 2 -type f -name "sitemap*" ! -name "sitemap.xml" ! -name "sitemap_index.xml" -exec rm -f {} \\; 2>/dev/null || true',
-    '',
-    '  # 1d. Eliminar backdoors que se hacen pasar por Google (conservar google-site-verification legítimo)',
-    '  find "$HTTPDOCS" -maxdepth 2 -type f -name "google*" ! -name "google-site-verification*" -exec rm -f {} \\; 2>/dev/null || true',
-    '',
-    '  # 1e. Purgar webshells comunes y archivos de spam',
-    '  rm -f "$HTTPDOCS"/default.php "$HTTPDOCS"/info.php "$HTTPDOCS"/wp-reset.php "$HTTPDOCS"/wp-feed.php "$HTTPDOCS"/wp-tmp.php "$HTTPDOCS"/wp-update.php 2>/dev/null || true',
-    '',
-    '  # 2. Hardening: WP_DEBUG_DISPLAY',
-    '  if ! grep -q "WP_DEBUG_DISPLAY" "$WP_CONFIG" 2>/dev/null; then',
-    '    echo "define(\'WP_DEBUG_DISPLAY\', false);" >> "$WP_CONFIG" 2>/dev/null',
-    '    echo "@ini_set(\'display_errors\', 0);" >> "$WP_CONFIG" 2>/dev/null',
-    '  fi',
-    '',
-    '  # 3. Optimización: WP_MEMORY_LIMIT',
-    '  if grep -q "WP_MEMORY_LIMIT" "$WP_CONFIG"; then',
-    '    sed -i "s/define( *.WP_MEMORY_LIMIT.*/define( \\"WP_MEMORY_LIMIT\\", \\"512M\\" );/g" "$WP_CONFIG"',
-    '  else',
-    '    sed -i "/That..s all, stop editing/i define( \\"WP_MEMORY_LIMIT\\", \\"512M\\" );" "$WP_CONFIG"',
-    '  fi',
-    '',
-    '  # 4. Strict File Permissions',
-    '  echo \'@@@PROGRESS@@@{"step":"permissions","msg":"Restaurando permisos seguros de archivos..."}@@@END@@@\'',
-    '  find "$HTTPDOCS" -type d -exec chmod 755 {} \\; 2>/dev/null || true',
-    '  find "$HTTPDOCS" -type f -exec chmod 644 {} \\; 2>/dev/null || true',
-    '  chmod 600 "$WP_CONFIG" 2>/dev/null || true',
-    '',
-    '  # 5. Purge Transients',
-    '  PREFIX=$(grep "table_prefix" "$WP_CONFIG" 2>/dev/null | head -1 | cut -d"\'" -f2 | cut -d\'"\' -f2 | xargs)',
-    '  [ -z "$PREFIX" ] && PREFIX="wp_"',
-    '  DB_NAME=$(grep "DB_NAME" "$WP_CONFIG" 2>/dev/null | head -1 | cut -d"\'" -f4)',
-    '  DB_USER=$(grep "DB_USER" "$WP_CONFIG" 2>/dev/null | head -1 | cut -d"\'" -f4)',
-    '  DB_PASS=$(grep "DB_PASSWORD" "$WP_CONFIG" 2>/dev/null | head -1 | cut -d"\'" -f4)',
-    '  if [ -n "$DB_NAME" ] && [ -n "$DB_USER" ]; then',
-    '    mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "DELETE FROM ${PREFIX}options WHERE option_name LIKE \\"\\_transient\\_%\\" OR option_name LIKE \\"\\_site\\_transient\\_%\\";" 2>/dev/null || true',
-    '  fi',
-    'fi',
-    '',
-    'echo \'@@@PROGRESS@@@{"step":"hardening","msg":"Aplicando escudo en .htaccess..."}@@@END@@@\'',
-    '',
-    'HT_PATH="$HTTPDOCS/.htaccess"',
-    'plesk ext wp-toolkit --wp-cli -domain "' + domain + '" -- rewrite flush --hard 2>/dev/null || true',
-    'if [ -f "$HT_PATH" ]; then',
-    '  if ! grep -q "<Files xmlrpc.php>" "$HT_PATH"; then',
-    '    printf "\\n<Files xmlrpc.php>\\n  Require all denied\\n</Files>\\n" >> "$HT_PATH"',
-    '  fi',
-    'else',
-    '  printf "<Files xmlrpc.php>\\n  Require all denied\\n</Files>\\n" > "$HT_PATH"',
-    '  chmod 644 "$HT_PATH"',
-    'fi',
-    '',
-    'echo \'@@@PROGRESS@@@{"step":"done","msg":"Sitio protegido con éxito"}@@@END@@@\'',
-    '',
-    'echo "[HARDEN OK] Hardening y optimización completados para ' + domain + '"'
-  ].join('\n');
-}
+// NOTA: generateHardenScript vivia aca. El hardening ahora es responsabilidad
+// exclusiva de src/services/hardening/ — habia dos scripts divergentes (este y
+// sourcesync/step10) que aplicaban medidas distintas. runHarden delega alli.
 
 /**
  * Ejecuta hardening sobre un cliente SSH existente con streaming de progreso.
@@ -508,30 +437,56 @@ function generateHardenScript(domain) {
  * @returns {Promise<{domain: string, success: boolean, error?: string}>}
  */
 async function runHarden(sshClient, domain, onProgress) {
-  const script = generateHardenScript(domain);
+  // Delega en el servicio de blindaje, que es la ÚNICA fuente de verdad del
+  // hardening. Antes este archivo tenía su propio script y sourcesync/step10
+  // tenía otro distinto: uno bloqueaba xmlrpc pero no protegía wp-config, el
+  // otro al revés. Ahora los dos consumen lo mismo.
+  const { applyHardening, verifyHardening } = require('./hardening/hardeningService');
   const sshService = getSshService();
 
-  const streamCallback = (chunk) => {
+  // Adaptador de contrato: el módulo nuevo emite { measure, status, msg } y
+  // los consumidores existentes (scanner.ipc.js y la UI) esperan { step, msg }.
+  const adaptarProgreso = (payload) => {
     if (typeof onProgress !== 'function') return;
-    const regex = /@@@PROGRESS@@@(.*?)@@@END@@@/g;
-    let match;
-    while ((match = regex.exec(chunk)) !== null) {
-      try {
-        const payload = JSON.parse(match[1]);
-        onProgress(payload);
-      } catch (_) { }
-    }
+    onProgress({ step: payload.measure || 'hardening', msg: payload.msg || '' });
   };
 
-  await sshService.executeStreamCommand(sshClient, script, streamCallback);
+  const aplicacion = await applyHardening(sshClient, domain, {
+    // El hardening histórico de este módulo también purgaba webshells y
+    // ajustaba memoria, así que se incluyen para no perder comportamiento.
+    measures: ['sanitize', 'files', 'xmlrpc', 'restapi', 'login', 'optimize', 'wpconfig'],
+    onProgress: adaptarProgreso,
+  });
+
+  if (!aplicacion.success && aplicacion.error) {
+    return { domain, success: false, error: aplicacion.error };
+  }
+
+  // Verificar y devolver el cumplimiento: aplicar sin comprobar deja al
+  // operador sin forma de saber si el blindaje realmente quedó puesto.
+  let verificacion = null;
+  try {
+    verificacion = await verifyHardening(sshClient, domain, { onProgress: adaptarProgreso });
+  } catch (_) { /* la verificación es informativa, no bloquea */ }
 
   // ── Elementor cache flush (no URLs — post-harden reassurance) ──
   try {
     await sshService.fixWordPressElementor(domain, null, null, sshClient);
   } catch (_) { /* silent */ }
 
-  // Si llegamos aquí sin excepción, el script se ejecutó correctamente
-  return { domain: domain, success: true };
+  if (typeof onProgress === 'function') {
+    onProgress({
+      step: 'done',
+      msg: verificacion ? `Sitio protegido — cumplimiento ${verificacion.score}%` : 'Sitio protegido con éxito',
+    });
+  }
+
+  return {
+    domain,
+    success: true,
+    score: verificacion?.score ?? null,
+    verify: verificacion,
+  };
 }
 
-module.exports = { generateAuditScript, generateCleanScript, generateHardenScript, runAudit, runClean, runHarden };
+module.exports = { generateAuditScript, generateCleanScript, runAudit, runClean, runHarden };

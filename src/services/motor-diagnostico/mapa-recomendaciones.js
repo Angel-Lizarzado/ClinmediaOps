@@ -296,17 +296,20 @@ plesk repair fs -y -vhosts ${dominio}`,
     }),
 
     PLESK_INSTANCE_NO_RESUELTA: () => ({
-      accionRecomendada: 'registrar_instancia_wptoolkit',
-      descripcion: 'WP Toolkit no tiene una instancia asociada al dominio o no puede resolver su instanceId.',
+      accionRecomendada: 'registrar_instancia_wptoolkit_autoheal',
+      descripcion:
+        'WP Toolkit no tiene una instancia asociada, el archivo ignore bloquea el registro o las credenciales de BD están desincronizadas. Se aplicará Auto-Heal completo.',
       comandoDiagnosticoPrevio:
         `plesk ext wp-toolkit --list 2>/dev/null | grep -i ${dominio} || true`,
       comandoMitigacion:
-        `DOMAIN_ID=$(plesk db -Ne "SELECT id FROM domains WHERE name='${dominio}'" 2>/dev/null | xargs); plesk ext wp-toolkit --detach -main-domain-id "$DOMAIN_ID" -path httpdocs 2>/dev/null || true; plesk ext wp-toolkit --register -main-domain-id "$DOMAIN_ID" -path httpdocs`,
+        `DOMAIN="${dominio}"; DOMAIN_ID=$(plesk db -Ne "SELECT id FROM domains WHERE name='$DOMAIN'" 2>/dev/null | xargs); WP_PATH="/var/www/vhosts/$DOMAIN/httpdocs"; if [ -n "$DOMAIN_ID" ] && [ -f "$WP_PATH/wp-config.php" ]; then rm -f "$WP_PATH/.wp-toolkit-ignore"; DB_NAME=$(grep -Eo "'DB_NAME'\\s*,\\s*'[^']+'" "$WP_PATH/wp-config.php" | awk -F"'" '{print $4}'); DB_USER=$(grep -Eo "'DB_USER'\\s*,\\s*'[^']+'" "$WP_PATH/wp-config.php" | awk -F"'" '{print $4}'); DB_PASS=$(grep -Eo "'DB_PASSWORD'\\s*,\\s*'[^']+'" "$WP_PATH/wp-config.php" | awk -F"'" '{print $4}'); if [ -n "$DB_NAME" ] && [ -n "$DB_USER" ]; then plesk db -e "CREATE OR REPLACE USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS'; CREATE OR REPLACE USER '$DB_USER'@'%' IDENTIFIED BY '$DB_PASS'; GRANT ALL PRIVILEGES ON \\\`$DB_NAME\\\`.* TO '$DB_USER'@'localhost'; GRANT ALL PRIVILEGES ON \\\`$DB_NAME\\\`.* TO '$DB_USER'@'%'; FLUSH PRIVILEGES;"; fi; plesk ext wp-toolkit --detach -main-domain-id "$DOMAIN_ID" -path httpdocs 2>/dev/null || true; plesk ext wp-toolkit --register -main-domain-id "$DOMAIN_ID" -path httpdocs; else echo "Error: Dominio o wp-config no existe"; exit 1; fi`,
       comandoAlternativoSeguro:
-        `plesk repair web ${dominio} -y && plesk repair fs -y -vhosts ${dominio}`,
-      riesgo: 'BAJO',
+        `plesk ext wp-toolkit --list 2>/dev/null | grep -i ${dominio} || true`,
+      riesgo: 'MEDIO',
       requiereConfirmacion: false,
-      notaAdicional: 'Muy común tras migraciones automáticas donde WP Toolkit no fue re-registrado.',
+      notaAdicional:
+        'El script de mitigación (Auto-Heal) eliminará el archivo .wp-toolkit-ignore, forzará la sincronización de credenciales de MariaDB con el wp-config.php y registrará la instancia.',
+      esAccionEscalada: true,
     }),
 
     DISCO_LLENO: () => ({

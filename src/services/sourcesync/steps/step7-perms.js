@@ -10,9 +10,10 @@ async function runStep7(ctx) {
 
   // ── Permisos del filesystem
   await ctx.run(`
-    find ${ctx.webRoot} -type f -exec chmod 644 {} \\; 2>/dev/null;
-    find ${ctx.webRoot} -type d -exec chmod 755 {} \\; 2>/dev/null;
-    chmod 600 ${ctx.webRoot}/wp-config.php 2>/dev/null || true
+    chown -R ${ctx.sysUser}:psacln "${ctx.webRoot}" 2>/dev/null || chown -R ${ctx.sysUser}:${ctx.sysUser} "${ctx.webRoot}" 2>/dev/null || true;
+    find "${ctx.webRoot}" -type d -exec chmod 755 {} + 2>/dev/null || true;
+    find "${ctx.webRoot}" -type f -exec chmod 644 {} + 2>/dev/null || true;
+    chmod 640 "${ctx.webRoot}/wp-config.php" 2>/dev/null || chmod 600 "${ctx.webRoot}/wp-config.php" 2>/dev/null || true;
   `, { timeout: TIMEOUTS.X_LONG, allowFail: true });
 
   log.detail(`permisos 644/755 aplicados ✓`);

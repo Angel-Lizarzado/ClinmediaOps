@@ -42,10 +42,87 @@ class DeploymentService {
     this.pleskCliService = getPleskCliService();
     this.extractionService = getExtractionService();
     this.detenerSolicitado = false;
+    // Profundidad de la ventana con domain-resolution-checker apagado.
+    this._resolutionCheckerDepth = 0;
   }
 
   solicitarParada() {
     this.detenerSolicitado = true;
+  }
+
+  // ── domain-resolution-checker de Plesk ──────────────────────────────────────
+  //
+  // Crear una suscripción para un dominio cuyo DNS todavía apunta al servidor
+  // origen exige apagar este chequeo. PERO es un ajuste GLOBAL del servidor,
+  // no por dominio: dejarlo apagado deja al Plesk entero sin esa protección.
+  //
+  // Antes se apagaba y prendía DENTRO del loop, una vez por dominio, y el
+  // restore era `.catch(() => {})` mudo. Un corte entre medio dejaba el
+  // servidor desprotegido de forma permanente y sin rastro en los logs.
+  //
+  // Ahora se cuenta la profundidad: el batch abre la ventana una sola vez y
+  // cada dominio se cuelga de ella. La restauración ocurre al cerrar la última
+  // y grita fuerte si falla.
+
+  async _setResolutionChecker(sshClient, enabled) {
+    const valor = enabled ? 'true' : 'false';
+    const result = await this.sshService.executeCommand(
+      sshClient,
+      `plesk bin server_pref -u -domain-resolution-checker ${valor}`,
+      { timeoutMs: 30000 }
+    );
+    if (result.code !== 0) {
+      throw new Error(result.stderr || result.stdout || `código ${result.code}`);
+    }
+    return result;
+  }
+
+  /**
+   * Ejecuta `fn` con el domain-resolution-checker apagado.
+   * Reentrante: si ya hay una ventana abierta, no vuelve a tocar el servidor.
+   *
+   * @param {import('ssh2').Client} sshClient
+   * @param {string} taskId
+   * @param {string} domain — solo para el log
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  async _withResolutionCheckerDisabled(sshClient, taskId, domain, fn) {
+    const yaAbierta = this._resolutionCheckerDepth > 0;
+    this._resolutionCheckerDepth += 1;
+
+    if (!yaAbierta) {
+      this.emitLog(taskId, domain, 10, '[PLESK] Deshabilitando domain-resolution-checker para la migración...');
+      try {
+        await this._setResolutionChecker(sshClient, false);
+      } catch (err) {
+        // Si no se pudo apagar, no se abrió ninguna ventana que cerrar.
+        this._resolutionCheckerDepth -= 1;
+        this.emitLog(taskId, domain, 10, `[PLESK] No se pudo deshabilitar domain-resolution-checker: ${err.message}. Se continúa igual.`);
+        return fn();
+      }
+    }
+
+    try {
+      return await fn();
+    } finally {
+      this._resolutionCheckerDepth -= 1;
+      if (this._resolutionCheckerDepth === 0) {
+        this.emitLog(taskId, domain, 10, '[PLESK] Restaurando domain-resolution-checker...');
+        try {
+          await this._setResolutionChecker(sshClient, true);
+        } catch (err) {
+          // Esto deja el servidor sin una protección. NO puede ser silencioso.
+          const aviso = `[PLESK][ATENCIÓN] No se pudo restaurar domain-resolution-checker en el servidor: ${err.message}. ` +
+            'Restaurarlo a mano con: plesk bin server_pref -u -domain-resolution-checker true';
+          console.error(aviso);
+          this.emitLog(taskId, domain, 10, aviso);
+          try {
+            require('./standard-emitter').getStandardEmitter('deployment').emit('error', aviso, domain);
+          } catch (_) { /* el log ya salió por los otros canales */ }
+        }
+      }
+    }
   }
 
   /**
@@ -101,18 +178,6 @@ class DeploymentService {
     const clean = base.replace(/[^a-zA-Z0-9]/g, '');
     // Truncate to 20 chars max
     return clean.substring(0, 20) || 'backup';
-  }
-
-  /**
-   * Resolve the actual filename in a directory matching a suffix.
-   * Handles IDN domains where the file on disk is Punycode but we look it up
-   * by the original domain.
-   */
-  resolveActualFile(dirPath, suffix, fallbackName) {
-    // Determinista: path.join(dirPath, domain.suffix) sin escanear directorio
-    const deterministicPath = path.join(dirPath, fallbackName);
-    if (require('fs').existsSync(deterministicPath)) return deterministicPath;
-    return path.join(dirPath, fallbackName);
   }
 
   /**
@@ -435,11 +500,11 @@ class DeploymentService {
       // ================================================================
       const fs = require('fs');
       // Opción C: TODO en Punycode — archivos locales y remotos sin caracteres especiales
-      let filesPath = this.resolveActualFile(domainPath, '.tar.gz', `${safeDom}.tar.gz`);
+      let filesPath = path.join(domainPath, `${safeDom}.tar.gz`);
       if (!fs.existsSync(filesPath)) {
-        filesPath = this.resolveActualFile(domainPath, '.tar', `${safeDom}.tar`);
+        filesPath = path.join(domainPath, `${safeDom}.tar`);
       }
-      let dbPath = this.resolveActualFile(domainPath, '.sql', `${safeDom}.sql`);
+      const dbPath = path.join(domainPath, `${safeDom}.sql`);
       const wpConfigPath = path.join(domainPath, 'wp-config.php');
       const isGz = filesPath.endsWith('.tar.gz');
 
@@ -585,16 +650,22 @@ class DeploymentService {
         const baseLogin = alphaDom.replace(/[^a-zA-Z0-9]/g, '').substring(0, 10);
         let currentLogin = baseLogin + crypto.randomBytes(2).toString('hex');
         let subCmd = `plesk bin subscription -c "${safeDom}" -owner KitDigital -service-plan "Default Domain" -ip "${pleskIp}" -login "${currentLogin}" -passwd "${subscriptionPassword}"`;
+        const EMIT = require('./standard-emitter').getStandardEmitter('deployment');
+
+        // La creación de la suscripción corre dentro de la ventana con el
+        // domain-resolution-checker apagado. El guard es reentrante: en un batch
+        // la ventana ya viene abierta y acá no se vuelve a tocar el servidor.
         try {
-          let subResult = await this.sshService.executeCommand(sshClient, subCmd, { timeoutMs: 1800000 });
-          const EMIT = require('./standard-emitter').getStandardEmitter('deployment');
+          let subResult = await this._withResolutionCheckerDisabled(sshClient, taskId, domain,
+            () => this.sshService.executeCommand(sshClient, subCmd, { timeoutMs: 1800000 }));
           EMIT.emit('debug', `[PLESK SUB] ${safeDom} code=${subResult.code} stderr=${(subResult.stderr || '').slice(0, 120)}`);
-          
+
           if (subResult.code !== 0 && subResult.stderr?.includes('The user') && subResult.stderr?.includes('already exists')) {
             EMIT.emit('debug', `[PLESK SUB] Colision de usuario en Plesk. Reintentando con login alternativo...`);
             currentLogin = baseLogin + crypto.randomBytes(3).toString('hex');
             subCmd = `plesk bin subscription -c "${safeDom}" -owner KitDigital -service-plan "Default Domain" -ip "${pleskIp}" -login "${currentLogin}" -passwd "${subscriptionPassword}"`;
-            subResult = await this.sshService.executeCommand(sshClient, subCmd, { timeoutMs: 1800000 });
+            subResult = await this._withResolutionCheckerDisabled(sshClient, taskId, domain,
+              () => this.sshService.executeCommand(sshClient, subCmd, { timeoutMs: 1800000 }));
             EMIT.emit('debug', `[PLESK SUB RETRY] ${safeDom} code=${subResult.code} stderr=${(subResult.stderr || '').slice(0, 120)}`);
           }
 

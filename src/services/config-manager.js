@@ -1,9 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const keytar = require('keytar');
-const crypto = require('crypto');
-const { safeStorage, app } = require('electron');
+const { safeStorage } = require('electron');
 
 class ConfigManager {
   constructor() {
@@ -20,11 +18,11 @@ class ConfigManager {
     const exeDir = process.execPath ? path.dirname(process.execPath) : process.cwd();
     this.configPath = path.join(path.resolve(exeDir, '..'), 'config.json');
 
-    this.serviceName = 'clinmedia-ops';
-    this.accountName = 'clinmedia-ops-config';
     this.config = null;
-    this.masterKey = null;
     this.env = env;
+    // Se pone en true si el config.json existe pero no se pudo leer.
+    // Mientras este en true, saveConfig se niega a escribir.
+    this.loadFailed = false;
   }
 
   // ── Resolución dinámica del workspace path ──
@@ -174,39 +172,38 @@ class ConfigManager {
 
   async initialize() {
     try {
-      // Try to get master key from OS keychain
-      try {
-        this.masterKey = await keytar.getPassword(this.serviceName, this.accountName);
-        
-        if (!this.masterKey) {
-          this.masterKey = crypto.randomBytes(32).toString('hex');
-          await keytar.setPassword(this.serviceName, this.accountName, this.masterKey);
-          console.log('Generated new master key and stored in OS keychain');
-        }
-      } catch (keytarError) {
-        console.warn('Keytar not available, using fallback key:', keytarError.message);
-        this.masterKey = crypto.randomBytes(32).toString('hex');
-      }
+      // El cifrado de credenciales lo hace safeStorage de Electron, que maneja
+      // su propia clave ligada al usuario/máquina. No hace falta una master key
+      // propia (antes se generaba una y se guardaba en el keychain sin usarla).
 
       // Load config file first (needed for workspaceRoot from electron-store)
       await this.loadConfig();
 
-      // Resolver y autocrear carpeta respaldos
-      const respaldosPath = this.getRespaldosPath();
-      if (!fs.existsSync(respaldosPath)) {
-        fs.mkdirSync(respaldosPath, { recursive: true });
-        console.log(`[RESPALDOS] Carpeta creada: ${respaldosPath}`);
+      // Resolver y autocrear carpeta respaldos de forma segura (sin abortar si el disco está offline)
+      try {
+        const respaldosPath = this.getRespaldosPath();
+        if (respaldosPath && !fs.existsSync(respaldosPath)) {
+          fs.mkdirSync(respaldosPath, { recursive: true });
+          console.log(`[RESPALDOS] Carpeta creada: ${respaldosPath}`);
+        }
+      } catch (dirErr) {
+        console.warn(`[RESPALDOS] No se pudo preparar carpeta de respaldos (${dirErr.message}). Se continúa con la configuración.`);
       }
 
       return this.config;
     } catch (error) {
-      console.error('Failed to initialize ConfigManager, using default config:', error);
-      this.config = this.getDefaultConfig();
+      console.error('Failed to initialize ConfigManager:', error);
+      if (!this.config) {
+        this.config = this.getDefaultConfig();
+      }
       return this.config;
     }
   }
 
   async loadConfig() {
+    // Se limpia en cada carga: una carga exitosa levanta el bloqueo.
+    this.loadFailed = false;
+
     try {
       if (!fs.existsSync(this.configPath)) {
         // Return defaults in-memory only — never create file on disk automatically
@@ -221,258 +218,256 @@ class ConfigManager {
       return this.config;
     } catch (error) {
       console.error('Failed to load config:', error);
+
+      // El archivo EXISTE pero no se pudo leer o parsear. Caer a defaults en
+      // silencio es lo peligroso: la UI muestra la lista vacía, el usuario
+      // agrega un servidor, y el saveConfig siguiente escribe esa config vacía
+      // encima de la buena. Se marca el fallo y saveConfig queda bloqueado
+      // hasta que alguien resuelva el archivo a mano.
+      if (fs.existsSync(this.configPath)) {
+        this.loadFailed = true;
+        try {
+          const rescate = `${this.configPath}.corrupto-${Date.now()}`;
+          fs.copyFileSync(this.configPath, rescate);
+          console.error(`[CONFIG] Copia del archivo ilegible guardada en: ${rescate}`);
+        } catch (copyErr) {
+          console.error(`[CONFIG] No se pudo copiar el archivo ilegible: ${copyErr.message}`);
+        }
+        console.error('[CONFIG] Guardado BLOQUEADO para no sobreescribir la configuración existente.');
+      }
+
       this.config = this.getDefaultConfig();
       return this.config;
     }
   }
 
+  /**
+   * Cuenta las entidades que le importan al usuario. Sirve para detectar el
+   * caso "estoy por escribir una config vacía encima de una con datos".
+   */
+  _countEntities(config) {
+    if (!config) return 0;
+    const cuentas = Array.isArray(config.accounts) ? config.accounts.length : 0;
+    const servidores = Array.isArray(config.destinationServers) ? config.destinationServers.length : 0;
+    return cuentas + servidores;
+  }
+
+  /**
+   * Red de seguridad antes de escribir: nunca sustituir una configuración con
+   * datos por una vacía. Sin esto, cualquier carga fallida seguida de un
+   * guardado borraba cuentas y servidores en silencio.
+   * @throws {Error} si la escritura destruiría datos
+   */
+  _assertSafeToSave() {
+    if (this.loadFailed) {
+      throw new Error(
+        '[CONFIG] Guardado bloqueado: el config.json existente no se pudo leer. ' +
+        'Se guardó una copia junto al original. Resolvé ese archivo antes de guardar, ' +
+        'o la configuración actual se perdería.'
+      );
+    }
+
+    if (this._countEntities(this.config) > 0) return;
+    if (!fs.existsSync(this.configPath)) return;
+
+    // La config en memoria está vacía. Si en disco hay datos, esto es un borrado.
+    let enDisco = 0;
+    try {
+      enDisco = this._countEntities(JSON.parse(fs.readFileSync(this.configPath, 'utf8')));
+    } catch (_) {
+      // Ilegible: lo trata loadFailed. Acá no se bloquea por esto.
+      return;
+    }
+
+    if (enDisco > 0) {
+      throw new Error(
+        `[CONFIG] Guardado bloqueado: se intentó escribir una configuración vacía sobre ` +
+        `${enDisco} cuentas/servidores existentes en ${this.configPath}. ` +
+        'Es casi seguro un error de carga, no una acción intencional.'
+      );
+    }
+  }
+
   async saveConfig() {
+    // Antes de cifrar nada: comprobar que la escritura no destruya datos.
+    this._assertSafeToSave();
+
     try {
       // Encrypt sensitive fields before saving
       await this.encryptConfig();
-      
+
       const configDir = path.dirname(this.configPath);
       if (!fs.existsSync(configDir)) {
         fs.mkdirSync(configDir, { recursive: true });
       }
-      
-      fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2), 'utf8');
-      
-      // Decrypt again for in-memory use
-      await this.decryptConfig();
-      
+
+      // Escritura atómica: se escribe a un temporal y se renombra. Un corte a
+      // mitad de camino dejaba antes un config.json truncado, sin credenciales.
+      const tmpPath = `${this.configPath}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(this.config, null, 2), 'utf8');
+
+      // Guardar la version anterior antes de sustituirla. Cuesta nada y es la
+      // diferencia entre un susto y una perdida real.
+      if (fs.existsSync(this.configPath)) {
+        try {
+          fs.copyFileSync(this.configPath, `${this.configPath}.bak`);
+        } catch (bakErr) {
+          console.warn(`[CONFIG] No se pudo respaldar el config previo: ${bakErr.message}`);
+        }
+      }
+
+      fs.renameSync(tmpPath, this.configPath);
+
       console.log('Config saved successfully');
     } catch (error) {
       console.error('Failed to save config:', error);
       throw error;
+    } finally {
+      // Siempre volver a texto plano en memoria, incluso si la escritura falló.
+      // Si no, la config en memoria quedaba cifrada y todo aguas abajo rompía.
+      await this.decryptConfig();
     }
+  }
+
+  // ── Cifrado de credenciales ───────────────────────────────────────────────
+  //
+  // Formato actual: prefijo `__ss__` + safeStorage de Electron (ligado al
+  // usuario/máquina). Formato legacy: base64 pelado, que NO es cifrado.
+  //
+  // Regla de oro: ante cualquier duda, se devuelve el valor original intacto.
+  // Nunca se devuelve null — antes se hacía, y el siguiente saveConfig()
+  // persistía ese null, borrando la credencial sin un solo error visible.
+
+  static get SS_PREFIX() { return '__ss__'; }
+
+  /**
+   * Recorre todas las credenciales de la config aplicando `fn` a cada valor
+   * sensible. Un solo lugar en vez de tres bloques duplicados por operación.
+   * @param {(value: string, label: string) => string} fn
+   */
+  _walkSecrets(fn) {
+    const applyTo = (holder, label) => {
+      if (!holder?.sshCredentials) return;
+      for (const field of ['privateKey', 'password']) {
+        const value = holder.sshCredentials[field];
+        if (typeof value === 'string' && value.length > 0) {
+          holder.sshCredentials[field] = fn(value, `${label}.${field}`);
+        }
+      }
+    };
+
+    for (const account of this.config.accounts || []) {
+      for (const cloud of account.originClouds || []) {
+        applyTo(cloud, `cloud "${cloud.name || '?'}"`);
+      }
+    }
+
+    for (const server of this.config.destinationServers || []) {
+      applyTo(server, `servidor "${server.name || '?'}"`);
+    }
+
+    for (const [section, field] of [['cloudflare', 'apiToken'], ['hostingerMail', 'apiToken']]) {
+      const value = this.config[section]?.[field];
+      if (typeof value === 'string' && value.length > 0) {
+        this.config[section][field] = fn(value, `${section}.${field}`);
+      }
+    }
+  }
+
+  /**
+   * Decide si un string es base64 legacy de verdad, no un texto plano que
+   * "casualmente" usa caracteres del alfabeto base64.
+   *
+   * Antes se decodificaba cualquier string de más de 4 chars, lo que convertía
+   * una contraseña en texto plano en basura binaria. Acá se exige que el valor
+   * sobreviva un round-trip exacto Y que lo decodificado sea texto imprimible.
+   */
+  _looksLikeLegacyBase64(value) {
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+    if (value.length % 4 !== 0) return false;
+
+    let decoded;
+    try {
+      decoded = Buffer.from(value, 'base64').toString('utf8');
+    } catch {
+      return false;
+    }
+
+    // Round-trip exacto: si no vuelve idéntico, no era base64.
+    if (Buffer.from(decoded, 'utf8').toString('base64') !== value) return false;
+    if (decoded.length === 0) return false;
+
+    // Lo decodificado tiene que ser texto usable, no bytes de control.
+    for (let i = 0; i < decoded.length; i++) {
+      const code = decoded.charCodeAt(i);
+      const isControl = code < 32 && code !== 9 && code !== 10 && code !== 13;
+      if (isControl) return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Cifra un único valor. Idempotente: un valor ya cifrado se devuelve tal cual,
+   * así un doble saveConfig() no produce doble cifrado.
+   */
+  _encryptValue(value, label) {
+    if (value.startsWith(ConfigManager.SS_PREFIX)) return value;
+
+    if (!safeStorage.isEncryptionAvailable()) {
+      // Sin safeStorage no hay cifrado real posible. Se deja en texto plano
+      // a propósito: base64 no protege nada y solo enmascara el problema.
+      console.warn(`[CONFIG] safeStorage no disponible — "${label}" queda SIN cifrar en disco.`);
+      return value;
+    }
+
+    try {
+      const encrypted = safeStorage.encryptString(value);
+      return ConfigManager.SS_PREFIX + encrypted.toString('base64');
+    } catch (err) {
+      console.error(`[CONFIG] Falló el cifrado de "${label}": ${err.message}. Se preserva el valor original.`);
+      return value;
+    }
+  }
+
+  /**
+   * Descifra un único valor. Nunca destruye datos: si algo falla, devuelve
+   * el valor tal como vino y lo reporta.
+   */
+  _decryptValue(value, label) {
+    if (value.startsWith(ConfigManager.SS_PREFIX)) {
+      if (!safeStorage.isEncryptionAvailable()) {
+        console.error(`[CONFIG] "${label}" está cifrado con safeStorage pero safeStorage no está disponible. Se preserva cifrado (fallará aguas abajo).`);
+        return value;
+      }
+      try {
+        const buffer = Buffer.from(value.slice(ConfigManager.SS_PREFIX.length), 'base64');
+        return safeStorage.decryptString(buffer);
+      } catch (err) {
+        console.error(`[CONFIG] No se pudo descifrar "${label}": ${err.message}. Se preserva el valor cifrado para no perderlo.`);
+        return value;
+      }
+    }
+
+    // Migración desde el formato legacy (base64 pelado).
+    if (this._looksLikeLegacyBase64(value)) {
+      try {
+        return Buffer.from(value, 'base64').toString('utf8');
+      } catch {
+        return value;
+      }
+    }
+
+    // Texto plano: se devuelve intacto.
+    return value;
   }
 
   async encryptConfig() {
-    // Use Electron safeStorage for credentials; fallback to legacy AES if unavailable
-    if (!safeStorage.isEncryptionAvailable()) {
-      console.warn('[CONFIG] safeStorage not available, using legacy AES encryption');
-      await this._legacyEncryptConfig();
-      return;
-    }
-
-    // Encrypt SSH private keys and passwords using safeStorage
-    if (this.config.accounts && Array.isArray(this.config.accounts)) {
-      for (const account of this.config.accounts) {
-        if (account.originClouds) {
-          for (const item of account.originClouds) {
-            if (item.sshCredentials?.privateKey) {
-              const encrypted = safeStorage.encryptString(item.sshCredentials.privateKey);
-              item.sshCredentials.privateKey = '__ss__' + encrypted.toString('base64');
-            }
-            if (item.sshCredentials?.password) {
-              const encrypted = safeStorage.encryptString(item.sshCredentials.password);
-              item.sshCredentials.password = '__ss__' + encrypted.toString('base64');
-            }
-          }
-        }
-      }
-    }
-
-    if (this.config.destinationServers && Array.isArray(this.config.destinationServers)) {
-      for (const server of this.config.destinationServers) {
-        if (server.sshCredentials?.privateKey) {
-          const encrypted = safeStorage.encryptString(server.sshCredentials.privateKey);
-          server.sshCredentials.privateKey = '__ss__' + encrypted.toString('base64');
-        }
-        if (server.sshCredentials?.password) {
-          const encrypted = safeStorage.encryptString(server.sshCredentials.password);
-          server.sshCredentials.password = '__ss__' + encrypted.toString('base64');
-        }
-      }
-    }
-
-    if (this.config.cloudflare?.apiToken) {
-      const encrypted = safeStorage.encryptString(this.config.cloudflare.apiToken);
-      this.config.cloudflare.apiToken = '__ss__' + encrypted.toString('base64');
-    }
-
-    if (this.config.hostingerMail?.apiToken) {
-      const encrypted = safeStorage.encryptString(this.config.hostingerMail.apiToken);
-      this.config.hostingerMail.apiToken = '__ss__' + encrypted.toString('base64');
-    }
+    this._walkSecrets((value, label) => this._encryptValue(value, label));
   }
 
   async decryptConfig() {
-    if (!safeStorage.isEncryptionAvailable()) {
-      console.warn('[CONFIG] safeStorage not available, using legacy AES decryption');
-      await this._legacyDecryptConfig();
-      return;
-    }
-
-    const decryptField = (value) => {
-      if (!value || typeof value !== 'string') return value;
-      if (value.startsWith('__ss__')) {
-        try {
-          const buffer = Buffer.from(value.slice(6), 'base64');
-          return safeStorage.decryptString(buffer);
-        } catch (err) {
-          console.error('[CONFIG] Failed to decrypt safeStorage field:', err.message);
-          return null;
-        }
-      }
-      // Fallback: try legacy base64 decode (for backward compat)
-      try {
-        const decoded = Buffer.from(value, 'base64').toString('utf8');
-        // Only use if it looks like a real credential (not garbage from double-decode)
-        if (decoded.includes('-----BEGIN') || decoded.length > 4) {
-          return decoded;
-        }
-      } catch {}
-      return value;
-    };
-
-    if (this.config.accounts && Array.isArray(this.config.accounts)) {
-      for (const account of this.config.accounts) {
-        if (account.originClouds) {
-          for (const item of account.originClouds) {
-            if (item.sshCredentials?.privateKey) {
-              item.sshCredentials.privateKey = decryptField(item.sshCredentials.privateKey);
-            }
-            if (item.sshCredentials?.password) {
-              item.sshCredentials.password = decryptField(item.sshCredentials.password);
-            }
-          }
-        }
-      }
-    }
-
-    if (this.config.destinationServers && Array.isArray(this.config.destinationServers)) {
-      for (const server of this.config.destinationServers) {
-        if (server.sshCredentials?.privateKey) {
-          server.sshCredentials.privateKey = decryptField(server.sshCredentials.privateKey);
-        }
-        if (server.sshCredentials?.password) {
-          server.sshCredentials.password = decryptField(server.sshCredentials.password);
-        }
-      }
-    }
-
-    if (this.config.cloudflare?.apiToken && typeof this.config.cloudflare.apiToken === 'string') {
-      this.config.cloudflare.apiToken = decryptField(this.config.cloudflare.apiToken);
-    }
-
-    if (this.config.hostingerMail?.apiToken && typeof this.config.hostingerMail.apiToken === 'string') {
-      this.config.hostingerMail.apiToken = decryptField(this.config.hostingerMail.apiToken);
-    }
-  }
-
-  async _legacyEncryptConfig() {
-    if (this.config.accounts && Array.isArray(this.config.accounts)) {
-      this.encryptCredentials(this.config.accounts, 'originClouds');
-    }
-    if (this.config.destinationServers && Array.isArray(this.config.destinationServers)) {
-      this.encryptServerCredentials(this.config.destinationServers);
-    }
-    
-    if (this.config.cloudflare?.apiToken) {
-      this.config.cloudflare.apiToken = Buffer.from(this.config.cloudflare.apiToken).toString('base64');
-    }
-  }
-
-  async _legacyDecryptConfig() {
-    if (this.config.accounts && Array.isArray(this.config.accounts)) {
-      this.decryptCredentials(this.config.accounts, 'originClouds');
-    }
-    if (this.config.destinationServers && Array.isArray(this.config.destinationServers)) {
-      this.decryptServerCredentials(this.config.destinationServers);
-    }
-    
-    if (this.config.cloudflare?.apiToken && typeof this.config.cloudflare.apiToken === 'string') {
-      const token = this.config.cloudflare.apiToken;
-      if (token.startsWith('__ss__')) {
-        console.warn('[CONFIG] safeStorage no disponible. Token Cloudflare cifrado preservado (fallará validación aguas abajo).');
-        return;
-      }
-      try {
-        const decrypted = Buffer.from(token, 'base64').toString('utf8');
-        this.config.cloudflare.apiToken = decrypted;
-      } catch (error) {
-        console.warn('Failed to decrypt Cloudflare token, may be already decrypted or in different format');
-      }
-    }
-  }
-
-  encryptCredentials(accounts, credentialType) {
-    for (const account of accounts) {
-      if (account[credentialType]) {
-        for (const item of account[credentialType]) {
-          if (item.sshCredentials?.privateKey) {
-            // Simple base64 encoding for demo - in production use proper encryption with IV
-            item.sshCredentials.privateKey = Buffer.from(item.sshCredentials.privateKey).toString('base64');
-          }
-          if (item.sshCredentials?.password) {
-            item.sshCredentials.password = Buffer.from(item.sshCredentials.password).toString('base64');
-          }
-        }
-      }
-    }
-  }
-
-  decryptCredentials(accounts, credentialType) {
-    for (const account of accounts) {
-      if (account[credentialType]) {
-        for (const item of account[credentialType]) {
-          if (item.sshCredentials?.privateKey && typeof item.sshCredentials.privateKey === 'string') {
-            if (!item.sshCredentials.privateKey.startsWith('__ss__')) {
-              try {
-                item.sshCredentials.privateKey = Buffer.from(item.sshCredentials.privateKey, 'base64').toString('utf8');
-              } catch (error) {
-                console.warn(`Failed to decrypt privateKey for ${item.name}, may be already decrypted`);
-              }
-            }
-          }
-          if (item.sshCredentials?.password && typeof item.sshCredentials.password === 'string') {
-            if (!item.sshCredentials.password.startsWith('__ss__')) {
-              try {
-                item.sshCredentials.password = Buffer.from(item.sshCredentials.password, 'base64').toString('utf8');
-              } catch (error) {
-                console.warn(`Failed to decrypt password for ${item.name}, may be already decrypted`);
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  encryptServerCredentials(servers) {
-    for (const server of servers) {
-      if (server.sshCredentials?.privateKey) {
-        server.sshCredentials.privateKey = Buffer.from(server.sshCredentials.privateKey).toString('base64');
-      }
-      if (server.sshCredentials?.password) {
-        server.sshCredentials.password = Buffer.from(server.sshCredentials.password).toString('base64');
-      }
-    }
-  }
-
-  decryptServerCredentials(servers) {
-    for (const server of servers) {
-      if (server.sshCredentials?.privateKey && typeof server.sshCredentials.privateKey === 'string') {
-        if (!server.sshCredentials.privateKey.startsWith('__ss__')) {
-          try {
-            server.sshCredentials.privateKey = Buffer.from(server.sshCredentials.privateKey, 'base64').toString('utf8');
-          } catch (error) {
-            console.warn(`Failed to decrypt privateKey for ${server.name}, may be already decrypted`);
-          }
-        }
-      }
-      if (server.sshCredentials?.password && typeof server.sshCredentials.password === 'string') {
-        if (!server.sshCredentials.password.startsWith('__ss__')) {
-          try {
-            server.sshCredentials.password = Buffer.from(server.sshCredentials.password, 'base64').toString('utf8');
-          } catch (error) {
-            console.warn(`Failed to decrypt password for ${server.name}, may be already decrypted`);
-          }
-        }
-      }
-    }
+    this._walkSecrets((value, label) => this._decryptValue(value, label));
   }
 
   ensureDefaultSshKey() {

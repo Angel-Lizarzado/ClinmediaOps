@@ -7,6 +7,7 @@ import DeploymentModule from './components/DeploymentModule';
 import ProvisioningModule from './components/ProvisioningModule';
 import ConfigPanel from './components/ConfigPanel';
 import MalwareScannerModule from './components/MalwareScannerModule';
+import HardeningModule from './components/HardeningModule';
 import SourceSyncModule from './components/SourceSyncModule';
 import SecurityModule from './components/SecurityModule';
 import CmsReconstructorModule from './components/CmsReconstructorModule';
@@ -30,6 +31,7 @@ const PERSISTENT_MODULE_IDS = [
   'provisioning',
   'config',
   'validation',
+  'hardening',
   'sourcesync',
   'security',
   'cms',
@@ -113,6 +115,10 @@ export default function App() {
 
               <ModulePane id="validation" activeModule={activeModule}>
                 <MalwareScannerModule onLog={logToConsole} logs={getModuleLogs('validation')} />
+              </ModulePane>
+
+              <ModulePane id="hardening" activeModule={activeModule}>
+                <HardeningModule onLog={logToConsole} />
               </ModulePane>
 
               <ModulePane id="sourcesync" activeModule={activeModule}>

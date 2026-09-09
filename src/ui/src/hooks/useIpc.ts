@@ -224,6 +224,10 @@ export interface ConfigData {
     apiToken: string;
     zoneId: string;
   };
+  elementorPro?: {
+    zipPath?: string;
+    licenseKey?: string;
+  };
   workspaceRoot: string;
 }
 

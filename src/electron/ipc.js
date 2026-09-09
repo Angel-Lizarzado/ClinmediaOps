@@ -47,6 +47,7 @@ const { registerProvisioningHandlers } = require('../main/ipc/provisioning.ipc')
 const { registerSyncDnsHandlers } = require('../main/ipc/syncdns.ipc');
 const { registerRescueSorterHandlers } = require('../main/ipc/rescuesorter.ipc');
 const { registerEmailHandlers } = require('../main/ipc/email.ipc');
+const { registerHardeningHandlers } = require('../main/ipc/hardening.ipc');
 
 // ── Initialize IPC Handlers ──
 
@@ -96,6 +97,7 @@ function initializeIpcHandlers(ipcMain, mainWindow) {
   registerSyncDnsHandlers(ipcMain, mainWindow, scope);
   registerRescueSorterHandlers(ipcMain, mainWindow);
   registerEmailHandlers(ipcMain, mainWindow);
+  registerHardeningHandlers(ipcMain, mainWindow, scope);
 }
 
 // ── Cleanup ──

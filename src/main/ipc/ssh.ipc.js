@@ -58,6 +58,37 @@ function sanitizeDays(value) {
   return Number.isFinite(n) && n > 0 ? n : 10;
 }
 
+// ─── Directorio de dumps de Plesk ─────────────────────────────────────────────
+// Ruta fija a propósito: nunca se construye desde input del renderer.
+const PLESK_DUMPS_DIR = '/var/lib/psa/dumps';
+
+// ─── Helper: normalizar un host escrito por el usuario ────────────────────────
+// Acepta "https://ejemplo.com:22", "ejemplo.com", "1.2.3.4" y devuelve el
+// hostname pelado. Devuelve null si no queda nada usable.
+function normalizeHost(rawHost) {
+  if (typeof rawHost !== 'string') return null;
+  const trimmed = rawHost.trim();
+  if (!trimmed) return null;
+
+  try {
+    const withProtocol = trimmed.includes('://') ? trimmed : `ssh://${trimmed}`;
+    const parsed = new URL(withProtocol);
+    // hostname quita el puerto y desenvuelve los corchetes de IPv6
+    return parsed.hostname.replace(/^\[|\]$/g, '') || null;
+  } catch {
+    // Fallback: cortar el puerto a mano
+    const sinPuerto = trimmed.split('/')[0].split(':')[0];
+    return sinPuerto || null;
+  }
+}
+
+// ─── Helper: ¿es una IPv4 literal? ────────────────────────────────────────────
+function isIpv4(value) {
+  const partes = value.split('.');
+  if (partes.length !== 4) return false;
+  return partes.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 function registerSshHandlers(ipcMain, mainWindow, scope) {
   const { isOperationRunning } = scope;
@@ -465,6 +496,133 @@ function registerSshHandlers(ipcMain, mainWindow, scope) {
       }
     }
   });
+
+  // ── Resolver un host a IP ───────────────────────────────────────────────────
+  // Lo usa ServerFormModal para reemplazar el dominio por su IP al dar de alta
+  // un servidor. El canal estaba en la whitelist del preload pero nunca tuvo
+  // handler: la UI recibía "No handler registered".
+  ipcMain.handle('server:resolve-ip', async (event, { host } = {}) => {
+    const hostname = normalizeHost(host);
+    if (!hostname) {
+      return { success: false, error: 'Host vacío o inválido' };
+    }
+
+    // Si ya es una IP, no hay nada que resolver
+    if (isIpv4(hostname)) {
+      return { success: true, ip: hostname, alreadyIp: true };
+    }
+
+    try {
+      const dns = require('dns');
+      const ips = await dns.promises.resolve4(hostname);
+      if (!ips || ips.length === 0) {
+        return { success: false, error: `"${hostname}" no tiene registros A` };
+      }
+      return { success: true, ip: ips[0], alreadyIp: false };
+    } catch (error) {
+      return { success: false, error: `No se pudo resolver "${hostname}": ${error.message}` };
+    }
+  });
+
+  // ── Purgar backups viejos de Plesk ──────────────────────────────────────────
+  // Elimina los archivos de /var/lib/psa/dumps más viejos que `daysRetention`.
+  // El canal estaba en la whitelist del preload pero nunca tuvo handler.
+  //
+  // OPERACIÓN DESTRUCTIVA. La confirmación vive en la UI (DrawerDangerZone pide
+  // tipear el nombre del servidor). Acá se protege por construcción:
+  //   - La ruta es una constante, jamás viene del renderer.
+  //   - daysRetention pasa por sanitizeDays (solo enteros positivos).
+  //   - `find` se limita a esa ruta, sin seguir symlinks (-P por defecto).
+  //   - `dryRun` permite medir sin borrar.
+  ipcMain.handle('purge-plesk-backups', async (event, { serverName, daysRetention = 10, dryRun = false } = {}) => {
+    let client = null;
+    const dias = sanitizeDays(daysRetention);
+
+    try {
+      const config = await getConfig();
+      const serverConfig = findDestinationServer(config, serverName);
+      const sshService = getSshService();
+
+      client = await sshService.connect(serverConfig.sshCredentials, `purge-backups-${serverName}`);
+
+      // El directorio tiene que existir: si Plesk no está donde esperamos,
+      // se aborta en vez de correr un find sobre una ruta inexistente.
+      const check = await sshService.executeCommand(
+        client,
+        `test -d ${PLESK_DUMPS_DIR} && echo OK || echo MISSING`,
+        { timeoutMs: 30000 }
+      );
+      if ((check.stdout || '').trim() !== 'OK') {
+        return { success: false, error: `No existe el directorio de dumps ${PLESK_DUMPS_DIR} en "${serverName}"` };
+      }
+
+      // Medir primero: cantidad de archivos y bytes que se van a liberar.
+      const medir = `find ${PLESK_DUMPS_DIR} -mindepth 1 -type f -mtime +${dias} -printf '%s\\n' 2>/dev/null | awk '{n++; s+=$1} END {printf "%d %d", n+0, s+0}'`;
+      const medicion = await sshService.executeCommand(client, medir, { timeoutMs: 300000 });
+      const [countRaw, bytesRaw] = (medicion.stdout || '0 0').trim().split(/\s+/);
+      const archivos = parseInt(countRaw, 10) || 0;
+      const bytes = parseInt(bytesRaw, 10) || 0;
+
+      if (archivos === 0) {
+        return {
+          success: true,
+          dryRun,
+          deletedFiles: 0,
+          freedBytes: 0,
+          message: `No hay backups con más de ${dias} días en "${serverName}"`,
+        };
+      }
+
+      if (dryRun) {
+        return {
+          success: true,
+          dryRun: true,
+          deletedFiles: 0,
+          candidateFiles: archivos,
+          freedBytes: 0,
+          candidateBytes: bytes,
+          message: `${archivos} archivos (${formatBytes(bytes)}) superan los ${dias} días`,
+        };
+      }
+
+      const borrar = `find ${PLESK_DUMPS_DIR} -mindepth 1 -type f -mtime +${dias} -delete 2>/dev/null; echo DONE`;
+      const resultado = await sshService.executeCommand(client, borrar, { timeoutMs: 900000 });
+      if (!(resultado.stdout || '').includes('DONE')) {
+        return { success: false, error: `La purga no terminó correctamente: ${resultado.stderr || 'sin salida'}` };
+      }
+
+      // Los datos de almacenamiento cacheados quedaron obsoletos.
+      delete STORAGE_CACHE[serverName];
+
+      return {
+        success: true,
+        dryRun: false,
+        deletedFiles: archivos,
+        freedBytes: bytes,
+        message: `${archivos} archivos eliminados, ${formatBytes(bytes)} liberados en "${serverName}"`,
+      };
+    } catch (error) {
+      console.error('[SSH] purge-plesk-backups falló:', error.message);
+      return { success: false, error: error.message };
+    } finally {
+      if (client) {
+        try { await getSshService().disconnect(client); } catch (_) { }
+      }
+    }
+  });
+}
+
+// ─── Helper: bytes a unidad legible ───────────────────────────────────────────
+function formatBytes(bytes) {
+  if (!bytes || bytes < 1024) return `${bytes || 0} B`;
+  const unidades = ['KB', 'MB', 'GB', 'TB'];
+  let valor = bytes / 1024;
+  let i = 0;
+  while (valor >= 1024 && i < unidades.length - 1) {
+    valor /= 1024;
+    i++;
+  }
+  return `${valor.toFixed(1)} ${unidades[i]}`;
 }
 
 module.exports = { registerSshHandlers };

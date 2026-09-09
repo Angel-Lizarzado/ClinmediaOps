@@ -81,6 +81,17 @@ const DEFAULT_STATE = {
   },
 
   // Cloudflare DNS Sync
+  cloudflare: {
+    isRunning: false,
+    currentDomain: '',
+    currentProgress: 0,
+    currentMessage: '',
+    totalDomains: 0,
+    currentIndex: 0,
+    results: [],
+    domainsQueue: [],
+    recentLogs: [],
+  },
 
   // SSL Let's Encrypt via Plesk
   ssl: {
@@ -121,6 +132,27 @@ const DEFAULT_STATE = {
     recentLogs: [],
   },
 
+  // Blindaje (hardening). Clave propia: antes escribía en `malware`, que es
+  // la del módulo de Validación, y un lote de blindaje le pisaba los
+  // resultados al scanner porque la UI monta los dos módulos a la vez.
+  hardening: {
+    isRunning: false,
+    currentDomain: '',
+    currentProgress: 0,
+    currentMessage: '',
+    totalDomains: 0,
+    currentIndex: 0,
+    results: [],
+    domainsQueue: [],
+    recentLogs: [],
+    dryRun: false,
+    averageScore: 0,
+  },
+
+  // Métricas de almacenamiento por servidor: { [serverName]: { data, timestamp } }
+  // Es una caché con TTL, no estado de proceso — por eso no se persiste.
+  storageMetrics: {},
+
   // Estado de conexión SSH (servidores)
   sshConnection: {
     isConnected: false,
@@ -157,23 +189,26 @@ const DEFAULT_STATE = {
 // ── Volatile keys — nunca se persisten a disco ──
 const VOLATILE_KEYS = ['results', 'recentLogs', 'domainsQueue', 'currentDomain', 'currentMessage', 'currentProgress', 'currentIndex', 'batchAccountName', 'batchCloudName', 'batchServerName', 'sourceAccount', 'sourceCloud', 'history'];
 
+// ── Módulos que NUNCA se persisten a disco ──
+// sshConnection depende de un ping en vivo; sourcesync y cms son de sesión.
+const NON_PERSISTED_MODULES = ['sshConnection', 'sourcesync', 'cms', 'storageMetrics'];
+
+// ── Ventana del throttle de broadcast (ms) ──
+const BROADCAST_THROTTLE_MS = 50;
+
 class AppStateManager {
   constructor() {
     this.persistStore = null;
-    this.state = {
-      extraction: { ...DEFAULT_STATE.extraction },
-      deployment: { ...DEFAULT_STATE.deployment },
-      syncdns: { ...DEFAULT_STATE.syncdns },
-      cloudflare: { ...DEFAULT_STATE.cloudflare },
-      ssl: { ...DEFAULT_STATE.ssl },
-      provisioning: { ...DEFAULT_STATE.provisioning },
-      malware: { ...DEFAULT_STATE.malware },
-      sshConnection: { ...DEFAULT_STATE.sshConnection },
-      sourcesync: { ...DEFAULT_STATE.sourcesync },
-      cms: { ...DEFAULT_STATE.cms },
-    };
+    // Derivado de DEFAULT_STATE: agregar un módulo allí lo habilita acá
+    // automáticamente. Nunca volver a enumerar módulos a mano.
+    this.state = {};
+    Object.keys(DEFAULT_STATE).forEach((key) => {
+      this.state[key] = { ...DEFAULT_STATE[key] };
+    });
     this._initialized = false;
     this._broadcastEnabled = true;
+    this._lastBroadcast = 0;
+    this._broadcastTimer = null;
   }
 
   /**
@@ -186,27 +221,28 @@ class AppStateManager {
 
     const { default: Store } = await import('electron-store');
 
-    this.persistStore = new Store({
-      name: 'app-state',
-      schema: {
-        extraction: { type: 'object', default: DEFAULT_STATE.extraction },
-        deployment: { type: 'object', default: DEFAULT_STATE.deployment },
-        syncdns: { type: 'object', default: DEFAULT_STATE.syncdns },
-        cloudflare: { type: 'object', default: DEFAULT_STATE.cloudflare },
-        ssl: { type: 'object', default: DEFAULT_STATE.ssl },
-        provisioning: { type: 'object', default: DEFAULT_STATE.provisioning },
-        malware: { type: 'object', default: DEFAULT_STATE.malware },
-        // sourcesync NO se persiste a disco (deploymentLog es volátil)
-      },
+    // Schema derivado de DEFAULT_STATE menos los módulos no persistidos.
+    const schema = {};
+    Object.keys(DEFAULT_STATE).forEach((key) => {
+      if (NON_PERSISTED_MODULES.includes(key)) return;
+      schema[key] = { type: 'object', default: DEFAULT_STATE[key] };
     });
+
+    this.persistStore = new Store({ name: 'app-state', schema });
 
     // Restaurar solo campos no-volátiles desde disco
     // results, recentLogs, domainsQueue, currentDomain, currentMessage,
     // currentProgress, currentIndex nunca se persisten — son volátiles
     this.state = {};
     Object.keys(DEFAULT_STATE).forEach(key => {
-      const persisted = this.persistStore.get(key, {});
       const defaults = { ...DEFAULT_STATE[key] };
+
+      if (NON_PERSISTED_MODULES.includes(key)) {
+        this.state[key] = defaults;
+        return;
+      }
+
+      const persisted = this.persistStore.get(key, {});
       // Merge: persisted values for non-volatile fields, defaults for volatile fields
       this.state[key] = { ...defaults, ...persisted };
       // Ensure volatile fields always come from defaults (never from disk)
@@ -216,32 +252,24 @@ class AppStateManager {
         }
       });
     });
-    // sshConnection never persists
-    this.state.sshConnection = { ...DEFAULT_STATE.sshConnection };
 
-    // Anti-Zombies: reset isRunning on all modules — processes don't survive a restart
+    // Anti-Zombies: reset isRunning on all modules — processes don't survive a restart.
+    // Solo se tocan los campos que el módulo YA declara en DEFAULT_STATE: hay
+    // módulos que son mapas (storageMetrics) y no deben recibir campos de proceso.
     Object.keys(this.state).forEach(key => {
-      if (this.state[key] && typeof this.state[key] === 'object') {
-        this.state[key].isRunning = false;
-        this.state[key].currentDomain = '';
-        this.state[key].currentProgress = 0;
-        this.state[key].currentMessage = '';
-        // Don't clear results — user might want to see what happened before restart
-      }
+      const modulo = this.state[key];
+      const defaults = DEFAULT_STATE[key];
+      if (!modulo || typeof modulo !== 'object' || !defaults) return;
+
+      if ('isRunning' in defaults) modulo.isRunning = false;
+      if ('currentDomain' in defaults) modulo.currentDomain = '';
+      if ('currentProgress' in defaults) modulo.currentProgress = 0;
+      if ('currentMessage' in defaults) modulo.currentMessage = '';
+      // Don't clear results — user might want to see what happened before restart
     });
 
     // Persist the cleaned state (volatile fields excluded) to prevent zombies
-    if (this.persistStore) {
-      Object.keys(this.state).forEach(key => {
-        if (key !== 'sshConnection') {
-          const persistable = { ...this.state[key] };
-          VOLATILE_KEYS.forEach(vk => {
-            delete persistable[vk];
-          });
-          this.persistStore.set(key, persistable);
-        }
-      });
-    }
+    Object.keys(this.state).forEach(key => this._persist(key));
 
     // Inicializar estado SSH con ping real a servidores configurados
     // Fire-and-forget: un fallo en SSH no debe bloquear el arranque
@@ -338,13 +366,7 @@ class AppStateManager {
     this.state[module] = { ...this.state[module], ...changes };
 
     // Persistir solo campos no-volátiles
-    if (this.persistStore) {
-      const persistable = { ...this.state[module] };
-      VOLATILE_KEYS.forEach(vk => {
-        delete persistable[vk];
-      });
-      this.persistStore.set(module, persistable);
-    }
+    this._persist(module);
 
     // Broadcast a todos los renderers vivos (throttled)
     this._broadcastThrottled();
@@ -360,13 +382,7 @@ class AppStateManager {
     }
 
     this.state[module] = { ...fullState };
-    if (this.persistStore) {
-      const persistable = { ...this.state[module] };
-      VOLATILE_KEYS.forEach(vk => {
-        delete persistable[vk];
-      });
-      this.persistStore.set(module, persistable);
-    }
+    this._persist(module);
     this._broadcastThrottled();
   }
 
@@ -393,13 +409,7 @@ class AppStateManager {
       return;
     }
     this.state[module] = { ...DEFAULT_STATE[module] };
-    if (this.persistStore) {
-      const persistable = { ...this.state[module] };
-      VOLATILE_KEYS.forEach(vk => {
-        delete persistable[vk];
-      });
-      this.persistStore.set(module, persistable);
-    }
+    this._persist(module);
     this._broadcastThrottled();
   }
 
@@ -448,13 +458,7 @@ class AppStateManager {
   resetAll() {
     Object.keys(DEFAULT_STATE).forEach((module) => {
       this.state[module] = { ...DEFAULT_STATE[module] };
-      if (this.persistStore) {
-        const persistable = { ...this.state[module] };
-        VOLATILE_KEYS.forEach(vk => {
-          delete persistable[vk];
-        });
-        this.persistStore.set(module, persistable);
-      }
+      this._persist(module);
     });
     this._broadcastThrottled();
   }
@@ -510,13 +514,7 @@ class AppStateManager {
     }
 
     // Persistir (solo campos no-volátiles)
-    if (this.persistStore) {
-      const persistable = { ...this.state[moduleId] };
-      VOLATILE_KEYS.forEach(vk => {
-        delete persistable[vk];
-      });
-      this.persistStore.set(moduleId, persistable);
-    }
+    this._persist(moduleId);
 
     // Broadcast a todos los renderers
     this._broadcastThrottled();
@@ -525,6 +523,27 @@ class AppStateManager {
   }
 
   // ── Privados ──
+
+  /**
+   * Persiste un módulo a disco, excluyendo los campos volátiles.
+   * No-op si el store todavía no cargó o si el módulo no se persiste.
+   */
+  _persist(module) {
+    if (!this.persistStore) return;
+    if (NON_PERSISTED_MODULES.includes(module)) return;
+    if (!this.state[module]) return;
+
+    const persistable = { ...this.state[module] };
+    VOLATILE_KEYS.forEach(vk => {
+      delete persistable[vk];
+    });
+
+    try {
+      this.persistStore.set(module, persistable);
+    } catch (err) {
+      console.warn(`[AppState] No se pudo persistir "${module}": ${err.message}`);
+    }
+  }
 
   _broadcast() {
     if (!this._broadcastEnabled) return;
@@ -548,15 +567,41 @@ class AppStateManager {
 
   /**
    * Broadcast con throttle: máximo 1 envío cada 50ms (20/segundo).
-   * Acumula cambios y envía el último estado conocido.
+   * Leading + trailing edge: si llega un cambio dentro de la ventana, se agenda
+   * un envío al final de la misma. El último estado SIEMPRE llega al renderer.
    */
   _broadcastThrottled() {
     if (!this._broadcastEnabled) return;
-    if (this._broadcastThrottled && Date.now() - this._lastBroadcast < 50) {
-      // Ya enviamos hace menos de 50ms, skip
+
+    const elapsed = Date.now() - this._lastBroadcast;
+
+    if (elapsed >= BROADCAST_THROTTLE_MS) {
+      if (this._broadcastTimer) {
+        clearTimeout(this._broadcastTimer);
+        this._broadcastTimer = null;
+      }
+      this._broadcast();
       return;
     }
-    this._broadcast();
+
+    // Dentro de la ventana: agendar el envío final (si no hay uno ya agendado)
+    if (this._broadcastTimer) return;
+
+    this._broadcastTimer = setTimeout(() => {
+      this._broadcastTimer = null;
+      this._broadcast();
+    }, BROADCAST_THROTTLE_MS - elapsed);
+  }
+
+  /**
+   * Cancela cualquier broadcast pendiente. Llamar durante el shutdown.
+   */
+  dispose() {
+    if (this._broadcastTimer) {
+      clearTimeout(this._broadcastTimer);
+      this._broadcastTimer = null;
+    }
+    this._broadcastEnabled = false;
   }
 }
 

@@ -5,11 +5,22 @@ const os = require('os');
 const { execSync } = require('child_process');
 const { getConfigManager } = require('./config-manager');
 
+// Timeout por defecto de cualquier comando remoto. Sin esto, un comando que
+// nunca cierra su stream deja la promesa colgada para siempre.
+// Se elige 30 min a propósito: es el techo que ya usaban los comandos lentos
+// (creación de suscripción, restore de BD), así que ningún flujo que hoy
+// funciona se rompe. Solo corta los cuelgues indefinidos.
+// Pasar `timeoutMs: 0` explícitamente lo desactiva para casos puntuales.
+const DEFAULT_COMMAND_TIMEOUT_MS = 1800000; // 30 minutos
+
+// Inactividad tras la cual se cierra una conexión del pool.
+const POOL_IDLE_TIMEOUT_MS = 180000; // 3 minutos
+
 class SshService {
   constructor() {
     this.configManager = getConfigManager();
     this.clients = new Map(); // taskId -> client
-    this.connectionPool = new Map(); // cacheKey -> { client, timer }
+    this.connectionPool = new Map(); // cacheKey -> { client, timer, active }
   }
 
   /**
@@ -117,19 +128,22 @@ class SshService {
 
     console.log(`[SSH-POOL] Creando NUEVA conexión compartida para ${cacheKey}`);
     const client = await this.connect(sshConfig, `pool-${cacheKey}`, readyTimeout);
-    
+
+    // Registrar la entrada ANTES de enganchar los listeners: si la conexión muere
+    // de inmediato, el handler debe encontrar la entrada para poder limpiarla.
+    this.connectionPool.set(cacheKey, { client, timer: null, active: 0 });
+
     // Monitor for unexpected closes
     client.on('close', () => {
       console.log(`[SSH-POOL] Conexión compartida cerrada: ${cacheKey}`);
-      this._removeCachedClient(cacheKey);
-    });
-    
-    client.on('error', () => {
-      console.log(`[SSH-POOL] Conexión compartida con error: ${cacheKey}`);
-      this._removeCachedClient(cacheKey);
+      this._removeCachedClient(cacheKey, client);
     });
 
-    this.connectionPool.set(cacheKey, { client, timer: null });
+    client.on('error', () => {
+      console.log(`[SSH-POOL] Conexión compartida con error: ${cacheKey}`);
+      this._removeCachedClient(cacheKey, client);
+    });
+
     this._resetIdleTimer(cacheKey);
 
     return client;
@@ -141,23 +155,89 @@ class SshService {
 
     if (poolEntry.timer) {
       clearTimeout(poolEntry.timer);
+      poolEntry.timer = null;
     }
 
-    // 3 minutos de inactividad
+    // Con una operación en vuelo NO se arma el timer: una transferencia larga
+    // no emite comandos y el idle timeout la mataba a mitad de camino.
+    if (poolEntry.active > 0) return;
+
     poolEntry.timer = setTimeout(() => {
+      const current = this.connectionPool.get(cacheKey);
+      // Guarda anti-race: si se reemplazó la entrada o hay actividad, no cerrar.
+      if (!current || current !== poolEntry || current.active > 0) return;
+
       console.log(`[SSH-POOL] Cerrando conexión inactiva (Idle Timeout 3m) para ${cacheKey}`);
       try {
         if (poolEntry.client) poolEntry.client.end();
-      } catch (e) {}
+      } catch (e) { /* ignore */ }
       this.connectionPool.delete(cacheKey);
-    }, 180000);
+    }, POOL_IDLE_TIMEOUT_MS);
   }
 
-  _removeCachedClient(cacheKey) {
+  /**
+   * Elimina una entrada del pool. Si se pasa `client`, solo elimina cuando
+   * coincide — evita que el 'close' de una conexión vieja borre la nueva.
+   */
+  _removeCachedClient(cacheKey, client = null) {
     const poolEntry = this.connectionPool.get(cacheKey);
     if (!poolEntry) return;
+    if (client && poolEntry.client !== client) return;
     if (poolEntry.timer) clearTimeout(poolEntry.timer);
     this.connectionPool.delete(cacheKey);
+  }
+
+  /**
+   * Busca la entrada del pool que corresponde a un cliente.
+   * @returns {[string, object]|null} par [cacheKey, poolEntry]
+   */
+  _findPoolEntry(client) {
+    for (const [key, poolEntry] of this.connectionPool.entries()) {
+      if (poolEntry.client === client) return [key, poolEntry];
+    }
+    return null;
+  }
+
+  /**
+   * Marca el inicio de una operación larga sobre un cliente del pool
+   * (descarga, subida, compresión remota). Mientras haya operaciones activas
+   * el idle timeout queda suspendido.
+   */
+  _beginPoolActivity(client) {
+    const found = this._findPoolEntry(client);
+    if (!found) return;
+    const [, poolEntry] = found;
+    poolEntry.active += 1;
+    if (poolEntry.timer) {
+      clearTimeout(poolEntry.timer);
+      poolEntry.timer = null;
+    }
+  }
+
+  /**
+   * Marca el fin de una operación larga. Al llegar a cero rearma el idle timeout.
+   */
+  _endPoolActivity(client) {
+    const found = this._findPoolEntry(client);
+    if (!found) return;
+    const [cacheKey, poolEntry] = found;
+    poolEntry.active = Math.max(0, poolEntry.active - 1);
+    if (poolEntry.active === 0) {
+      this._resetIdleTimer(cacheKey);
+    }
+  }
+
+  /**
+   * Envuelve una operación larga sobre un cliente del pool, suspendiendo el
+   * idle timeout mientras dura y rearmándolo pase lo que pase.
+   */
+  async _withPoolActivity(client, fn) {
+    this._beginPoolActivity(client);
+    try {
+      return await fn();
+    } finally {
+      this._endPoolActivity(client);
+    }
   }
 
   async connect(sshConfig, taskId = 'default', readyTimeout = 40000) {
@@ -326,35 +406,46 @@ class SshService {
 
   async executeCommand(client, command, options = {}) {
     // Si es un cliente del pool de multiplexación, reiniciamos su timer de inactividad
-    for (const [key, poolEntry] of this.connectionPool.entries()) {
-      if (poolEntry.client === client) {
-        this._resetIdleTimer(key);
-        break;
-      }
-    }
+    const found = this._findPoolEntry(client);
+    if (found) this._resetIdleTimer(found[0]);
+
+    // `timeoutMs` es nuestro, no de ssh2: se separa antes de pasar las opciones
+    // de exec. `timeoutMs: 0` desactiva el timeout de forma explícita.
+    const { timeoutMs, ...execOptions } = options;
+    const effectiveTimeout = timeoutMs === undefined ? DEFAULT_COMMAND_TIMEOUT_MS : timeoutMs;
+
     return new Promise((resolve, reject) => {
-      client.exec(command, options, (err, stream) => {
+      client.exec(command, execOptions, (err, stream) => {
         if (err) {
           reject(err);
           return;
         }
-        
+
         let stdout = '';
         let stderr = '';
-        
+        let timeoutTimer = null;
+        let settled = false;
+
+        const finish = (fn, arg) => {
+          if (settled) return;
+          settled = true;
+          if (timeoutTimer) {
+            clearTimeout(timeoutTimer);
+            timeoutTimer = null;
+          }
+          fn(arg);
+        };
+
         stream.on('data', (data) => {
           stdout += data.toString();
         });
-        
+
         stream.stderr.on('data', (data) => {
           stderr += data.toString();
         });
-        
-        let timeoutTimer = null;
 
         stream.on('close', (code, signal) => {
-          if (timeoutTimer) clearTimeout(timeoutTimer);
-          resolve({
+          finish(resolve, {
             stdout: stdout.trim(),
             stderr: stderr.trim(),
             code: code,
@@ -362,16 +453,18 @@ class SshService {
           });
         });
 
-        if (options.timeoutMs) {
-          timeoutTimer = setTimeout(() => {
-            stream.close();
-            reject(new Error(`Command timed out after ${options.timeoutMs}ms: ${command.substring(0, 50)}...`));
-          }, options.timeoutMs);
-        }
-        
-        stream.on('error', (err) => {
-          reject(err);
+        stream.on('error', (streamErr) => {
+          finish(reject, streamErr);
         });
+
+        if (effectiveTimeout > 0) {
+          timeoutTimer = setTimeout(() => {
+            try { stream.close(); } catch (e) { /* ignore */ }
+            finish(reject, new Error(
+              `Command timed out after ${effectiveTimeout}ms: ${command.substring(0, 80)}...`
+            ));
+          }, effectiveTimeout);
+        }
       });
     });
   }
@@ -385,7 +478,7 @@ class SshService {
    * @param {function} onProgress - Callback llamado con cada chunk de stdout (string)
    * @returns {Promise<{stdout: string, stderr: string, code: number}>}
    */
-  async executeStreamCommand(client, command, onProgress) {
+  async _executeStreamCommandImpl(client, command, onProgress) {
     return new Promise((resolve, reject) => {
       client.exec(command, (err, stream) => {
         if (err) {
@@ -428,7 +521,7 @@ class SshService {
     });
   }
 
-  async injectPublicKey(client, publicKeyPath) {
+  async _injectPublicKeyImpl(client, publicKeyPath) {
     const resolvedPath = this.resolvePath(publicKeyPath);
     
     let publicKey;
@@ -457,7 +550,42 @@ class SshService {
     }
   }
 
+  // ── Operaciones largas: envueltas para suspender el idle timeout del pool ──
+  // La implementación real vive en _<nombre>Impl.
+
   async uploadFile(client, localPath, remotePath) {
+    return this._withPoolActivity(client, () => this._uploadFileImpl(client, localPath, remotePath));
+  }
+
+  async downloadFile(client, remotePath, localPath) {
+    return this._withPoolActivity(client, () => this._downloadFileImpl(client, remotePath, localPath));
+  }
+
+  async downloadFileWithProgress(client, remotePath, localPath, onProgress) {
+    return this._withPoolActivity(client, () => this._downloadFileWithProgressImpl(client, remotePath, localPath, onProgress));
+  }
+
+  async streamRemoteCompress(client, remotePath, localPath, onProgress) {
+    return this._withPoolActivity(client, () => this._streamRemoteCompressImpl(client, remotePath, localPath, onProgress));
+  }
+
+  async uploadFileFast(client, localPath, remotePath, onProgress) {
+    return this._withPoolActivity(client, () => this._uploadFileFastImpl(client, localPath, remotePath, onProgress));
+  }
+
+  async executeStreamCommand(client, command, onProgress) {
+    return this._withPoolActivity(client, () => this._executeStreamCommandImpl(client, command, onProgress));
+  }
+
+  async executeRemoteScript(client, scriptContent, scriptName = null) {
+    return this._withPoolActivity(client, () => this._executeRemoteScriptImpl(client, scriptContent, scriptName));
+  }
+
+  async injectPublicKey(client, publicKeyPath) {
+    return this._withPoolActivity(client, () => this._injectPublicKeyImpl(client, publicKeyPath));
+  }
+
+  async _uploadFileImpl(client, localPath, remotePath) {
     return new Promise((resolve, reject) => {
       client.sftp((err, sftp) => {
         if (err) {
@@ -483,7 +611,7 @@ class SshService {
     });
   }
 
-  async downloadFile(client, remotePath, localPath) {
+  async _downloadFileImpl(client, remotePath, localPath) {
     return new Promise((resolve, reject) => {
       client.sftp((err, sftp) => {
         if (err) {
@@ -515,7 +643,7 @@ class SshService {
     });
   }
 
-  async downloadFileWithProgress(client, remotePath, localPath, onProgress) {
+  async _downloadFileWithProgressImpl(client, remotePath, localPath, onProgress) {
     const sftp = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(new Error('[SFTP] Timeout: No se pudo establecer conexión SFTP en 10s'));
@@ -638,7 +766,7 @@ class SshService {
    * @param {string} localPath - Local file path (should end in .tar.gz)
    * @param {Function} onProgress - Callback(receivedBytes, totalEstimate, pct, message)
    */
-  async streamRemoteCompress(client, remotePath, localPath, onProgress) {
+  async _streamRemoteCompressImpl(client, remotePath, localPath, onProgress) {
     // ── 1. Estimate remote size via du (with ~5% compression overhead buffer) ──
     let estimatedSize = 0;
     try {
@@ -734,7 +862,7 @@ class SshService {
    * @param {string} remotePath - Remote file path
    * @param {Function} onProgress - Callback(transferred, total, percent, message)
    */
-  async uploadFileFast(client, localPath, remotePath, onProgress) {
+  async _uploadFileFastImpl(client, localPath, remotePath, onProgress) {
     const sftp = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(new Error('[SFTP] Timeout: No se pudo establecer conexión SFTP en 10s'));
@@ -809,7 +937,7 @@ class SshService {
     }
   }
 
-  async executeRemoteScript(client, scriptContent, scriptName = null) {
+  async _executeRemoteScriptImpl(client, scriptContent, scriptName = null) {
     // Generate a unique script name with UUID if not provided
     const { v4: uuidv4 } = require('uuid');
     const scriptId = scriptName || `script_${uuidv4().replace(/-/g, '')}.sh`;
@@ -862,6 +990,18 @@ class SshService {
       }
     }
     this.clients.clear();
+
+    // El pool de multiplexación se limpiaba nunca: sus conexiones y sus timers
+    // de inactividad sobrevivían al cierre de la app.
+    for (const [cacheKey, poolEntry] of this.connectionPool.entries()) {
+      if (poolEntry.timer) clearTimeout(poolEntry.timer);
+      try {
+        if (poolEntry.client) poolEntry.client.end();
+      } catch (error) {
+        console.warn(`Error cerrando conexión del pool ${cacheKey}:`, error.message);
+      }
+    }
+    this.connectionPool.clear();
   }
 
   /**

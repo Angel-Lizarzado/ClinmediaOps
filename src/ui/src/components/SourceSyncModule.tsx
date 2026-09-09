@@ -243,16 +243,23 @@ const SourceSyncModule: React.FC<SourceSyncModuleProps> = ({ onLog }) => {
     return () => { cleanupRef.current?.(); cleanupRef.current = null; };
   }, []);
 
-  // ── Escuchar app:state-update para sincronizar deploymentLog ───────────────
+  // ── Escuchar state:update para sincronizar deploymentLog ───────────────────
+  // Antes escuchaba 'app:state-update', un canal que ningún emisor manda, con
+  // una forma de payload ({ module, state }) que tampoco existe. El listener
+  // nunca se disparó. AppStateManager._broadcast() emite 'state:update' con el
+  // estado completo, un módulo por clave.
   useEffect(() => {
     const handler = (payload: any) => {
-      if (payload?.module !== 'sourcesync' || !payload?.state) return;
-      const sl = payload.state;
+      const sl = payload?.sourcesync;
+      if (!sl) return;
       if (sl.deploymentLog) setDeploymentLog([...sl.deploymentLog]);
       if (typeof sl.isRunning === 'boolean') setDesplegando(sl.isRunning);
     };
-    api?.receive('app:state-update', handler);
-    return () => api?.removeListener('app:state-update', handler);
+    const cleanup = api?.receive('state:update', handler);
+    return () => {
+      if (typeof cleanup === 'function') cleanup();
+      else api?.removeListener('state:update', handler);
+    };
   }, []);
 
   // ── Toggle acordeón ────────────────────────────────────────────────────────

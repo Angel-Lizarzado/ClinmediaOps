@@ -241,34 +241,16 @@ function registerExtractionHandlers(ipcMain, mainWindow, scope) {
   // ── Extracción Ultra-Lite (solo uploads + config.json + SQL crudo) ──
   ipcMain.removeHandler('extraction:extract-ultra-lite');
   ipcMain.handle('extraction:extract-ultra-lite', async (event, { accountName, cloudName, domains }) => {
-    if (isExtracting) return { success: false, error: 'Ya hay una extracción en progreso' };
+    // Se chequean AMBOS locks. Antes solo miraba el local, así que una extracción
+    // Ultra-Lite podía arrancar encima de un deploy en curso y colisionar por SSH.
+    if (isExtracting || isOperationRunning.value) {
+      return { success: false, error: '[COLA] Ya hay una operación en curso. Espere a que finalice.' };
+    }
 
     isExtracting = true;
     isOperationRunning.value = true;
+
     const appState = getAppStateManager();
-    const progressEmitter = getProgressEmitter();
-    const workspaceManager = getWorkspaceManager();
-    await workspaceManager.initialize();
-    const extractionService = getExtractionService();
-
-    // RESET antes de correr — evita acumulación de resultados/logs de corridas anteriores
-    appState.resetModuleState('extraction');
-    appState.update('extraction', {
-      isRunning: true,
-      currentDomain: '',
-      currentProgress: 0,
-      currentMessage: 'Iniciando extracción Ultra-Lite...',
-      totalDomains: domains.length,
-      currentIndex: 0,
-      domainsQueue: domains,
-      batchAccountName: accountName,
-      batchCloudName: cloudName,
-      results: domains.map(d => ({ domain: d, status: 'pending', message: 'En cola...' })),
-    });
-
-    event.sender.send('extraction:state-changed', appState.getState('extraction'));
-    await new Promise(r => setTimeout(r, 150));
-
     const batchResults = [];
 
     // Helper para actualizar en tiempo real el estado de un dominio en el AppState e IPC
@@ -287,7 +269,33 @@ function registerExtractionHandlers(ipcMain, mainWindow, scope) {
       event.sender.send('domain-process-result', { module: 'EXTRACT', domain, status, message });
     };
 
+    // TODO lo que sigue va dentro del try: la preparación tiene awaits que pueden
+    // fallar y antes quedaban fuera, dejando los locks tomados de forma permanente
+    // (la app necesitaba reinicio para volver a extraer).
     try {
+      const progressEmitter = getProgressEmitter();
+      const workspaceManager = getWorkspaceManager();
+      await workspaceManager.initialize();
+      const extractionService = getExtractionService();
+
+      // RESET antes de correr — evita acumulación de resultados/logs de corridas anteriores
+      appState.resetModuleState('extraction');
+      appState.update('extraction', {
+        isRunning: true,
+        currentDomain: '',
+        currentProgress: 0,
+        currentMessage: 'Iniciando extracción Ultra-Lite...',
+        totalDomains: domains.length,
+        currentIndex: 0,
+        domainsQueue: domains,
+        batchAccountName: accountName,
+        batchCloudName: cloudName,
+        results: domains.map(d => ({ domain: d, status: 'pending', message: 'En cola...' })),
+      });
+
+      event.sender.send('extraction:state-changed', appState.getState('extraction'));
+      await new Promise(r => setTimeout(r, 150));
+
       for (let i = 0; i < domains.length; i++) {
         const domain = domains[i];
         appState.update('extraction', { 

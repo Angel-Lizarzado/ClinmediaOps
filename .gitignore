@@ -43,3 +43,5 @@ build/
 .opencode/
 .openclaw/
 *.log
+# Indice de CodeGraph (local, por checkout)
+.codegraph/

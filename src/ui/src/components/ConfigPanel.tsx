@@ -145,7 +145,8 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ onLog }) => {
       try {
         const wp = await api.invoke('workspace:get-path');
         if (wp?.success) {
-          setWorkspacePath(wp.path || '');
+          setWorkspacePath(wp.workspacePath || '');
+          setRespaldosPath(wp.respaldosPath || '');
         }
       } catch { /* silencioso */ }
     })();

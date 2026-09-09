@@ -1,7 +1,7 @@
 import React from 'react';
 import {
   LayoutDashboard, Rocket, Globe, Archive, Database, LifeBuoy,
-  GitMerge, ShieldCheck, Settings, FileText, HelpCircle, Terminal, Bell, Wrench
+  GitMerge, ShieldCheck, Settings, FileText, HelpCircle, Terminal, Bell, Wrench, Shield
 } from 'lucide-react';
 
 interface MainLayoutProps {
@@ -18,6 +18,7 @@ const NAV_ITEMS = [
   { id: 'migration',    icon: Rocket,          label: 'Migración' },
   { id: 'provisioning', icon: Database,        label: 'DNS -> SSL' },
   { id: 'validation',   icon: ShieldCheck,     label: 'Validación' },
+  { id: 'hardening',    icon: Shield,          label: 'Blindaje' },
   { id: 'sourcesync',   icon: GitMerge,        label: 'Git -> Plesk' },
   { id: 'cms',          icon: Wrench,          label: 'Reconstructor' },
   { id: 'rescuesorter', icon: LifeBuoy,        label: 'Organizador Rescue' },
@@ -30,6 +31,7 @@ const MODULE_TITLES: Record<string, string> = {
   migration:    'Migración',
   provisioning: 'DNS -> SSL',
   validation:   'Validación',
+  hardening:    'Blindaje',
   sourcesync:   'Git -> Plesk',
   cms:          'Reconstructor',
   rescuesorter: 'Organizador Rescue',
@@ -42,12 +44,18 @@ const MainLayout: React.FC<MainLayoutProps> = ({ children, activeModule, setActi
 
   React.useEffect(() => {
     try {
+      const electronAPI = (window as any).electronAPI;
       const api = (window as any).api;
-      if (api) {
-        api.invoke('app:get-version').then((v: string) => setAppVersion(v)).catch(() => setAppVersion('2.4.0'));
+      const getter = electronAPI?.getAppVersion
+        ? () => electronAPI.getAppVersion()
+        : api?.invoke
+          ? () => api.invoke('app:get-version')
+          : null;
+      if (getter) {
+        getter().then((v: string) => setAppVersion(v)).catch(() => setAppVersion('?'));
       }
     } catch {
-      setAppVersion('2.4.0');
+      setAppVersion('?');
     }
   }, []);
 

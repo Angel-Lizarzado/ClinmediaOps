@@ -59,6 +59,10 @@ export interface ConfigData {
   accounts: AccountConfig[];
   destinationServers: DestinationServerConfig[];
   cloudflare: CloudflareConfig;
+  elementorPro?: {
+    zipPath?: string;
+    licenseKey?: string;
+  };
   workspaceRoot: string;
 }
 

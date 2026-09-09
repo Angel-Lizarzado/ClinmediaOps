@@ -71,6 +71,24 @@ const OBFUSCATOR_OPTIONS = {
  */
 const SKIP_FILES = new Set([
   'src/services/sql-sanitizer.js',
+  // preload.js corre en el sandbox de Electron, donde `require` es una versión
+  // restringida (preloadRequire). El ofuscador codifica los strings de require()
+  // en base64, y el sandbox no puede resolver paths dinámicos/codificados.
+  'src/electron/preload.js',
+  // ipc-channels.generated.js se carga desde preload.js vía el sandbox require.
+  // Debe mantener su estructura de module.exports intacta para que el sandbox
+  // pueda resolverlo correctamente.
+  'src/electron/ipc-channels.generated.js',
+]);
+
+/**
+ * Directorios que NO se empaquetan. Los tests no tienen por qué viajar dentro
+ * del instalador: solo inflan el .asar y exponen estructura interna.
+ */
+const SKIP_DIRS = new Set([
+  '__tests__',
+  '__mocks__',
+  '__snapshots__',
 ]);
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -86,7 +104,17 @@ function processDir(srcDir, destDir) {
     const destPath = path.join(destDir, entry.name);
 
     if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) {
+        console.log(`  [omitido]   ${path.relative(ROOT, srcPath)}/ (no se empaqueta)`);
+        continue;
+      }
       processDir(srcPath, destPath);
+      continue;
+    }
+
+    // Archivos de test sueltos fuera de __tests__
+    if (/\.(test|spec)\.js$/.test(entry.name)) {
+      console.log(`  [omitido]   ${path.relative(ROOT, srcPath)} (test, no se empaqueta)`);
       continue;
     }
 

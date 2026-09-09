@@ -1,5 +1,20 @@
 const { app, BrowserWindow, ipcMain, globalShortcut, dialog } = require('electron');
 
+// ── Candado de instancia única: impide que múltiples procesos de la app corran en simultáneo y bloqueen el instalador ──
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  console.log('[APP] Otra instancia ya está en ejecución. Saliendo...');
+  app.quit();
+  process.exit(0);
+}
+
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  }
+});
+
 // ── IPC: versión de la app ────────────────────────────────────────────────────
 ipcMain.handle('app:get-version', () => app.getVersion());
 const path = require('path');
@@ -115,7 +130,23 @@ ipcMain.on('updater:check-manually', () => {
 
 // IPC: el frontend puede pedir la instalación manual
 ipcMain.on('updater:quit-and-install', () => {
-  autoUpdater.quitAndInstall(false, true);
+  console.log('[UPDATER] Cerrando recursos y ventanas para instalar actualización...');
+  shutdown();
+
+  // Destruir TODAS las ventanas para liberar handles al binario
+  const allWindows = BrowserWindow.getAllWindows();
+  for (const win of allWindows) {
+    try {
+      win.removeAllListeners('close');
+      win.destroy();
+    } catch { /* ya cerrada */ }
+  }
+  mainWindow = null;
+  splashWindow = null;
+
+  // isSilent=true activa el Restart Manager de Windows que gestiona
+  // file locks del proceso actual. isForceRunAfter=true reabre la app.
+  autoUpdater.quitAndInstall(true, true);
 });
 
 function createSplashWindow() {
@@ -159,6 +190,7 @@ function createMainWindow() {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: false,
     },
   });
 
@@ -236,6 +268,9 @@ function createMainWindow() {
         message: 'Hay una migración o sincronización en curso. Si cierras la aplicación ahora, el proceso se interrumpirá abruptamente.\n\n¿Estás seguro de que quieres salir?'
       });
       if (choice === 0) {
+        // Cortar de verdad: cerrar SSH y detener polls antes de destruir la ventana.
+        // Antes solo se cerraba la ventana y los procesos quedaban colgando.
+        shutdown();
         mainWindow.removeAllListeners('close');
         mainWindow.close();
       }
@@ -297,8 +332,35 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', () => {
-  console.log('Application shutting down...');
-});
+// Teardown idempotente: puede dispararse por before-quit y por window-all-closed.
+let shutdownDone = false;
+function shutdown() {
+  if (shutdownDone) return;
+  shutdownDone = true;
+
+  console.log('[SHUTDOWN] Cerrando la aplicación...');
+
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+
+  // Cierra conexiones SSH, detiene los polls de métricas y libera los
+  // suscriptores de progreso. Sin esto quedaban procesos colgados al salir.
+  try {
+    ipc.cleanup();
+    console.log('[SHUTDOWN] Handlers IPC liberados');
+  } catch (err) {
+    console.warn('[SHUTDOWN] Error durante el cleanup de IPC:', err.message);
+  }
+
+  try {
+    getAppStateManager().dispose();
+  } catch (err) {
+    console.warn('[SHUTDOWN] Error al liberar AppState:', err.message);
+  }
+}
+
+app.on('before-quit', shutdown);
 
 module.exports = { createWindow: createMainWindow, initializeIpc, initializeServices };
